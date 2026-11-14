@@ -37,8 +37,22 @@ done
 info "下载脚本 ..."
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-curl -fsSL --max-time 60 -o "$TMP/mr.sh"     "$RAW/mr.sh"     || { err "下载 mr.sh 失败"; exit 1; }
-curl -fsSL --max-time 60 -o "$TMP/mr-api.py" "$RAW/mr-api.py" || { err "下载 mr-api.py 失败"; exit 1; }
+RV="$(curl -fsSL -H 'Cache-Control: no-cache' --max-time 30 "$RAW/version.txt" 2>/dev/null | tr -d '\r\n ')"
+curl -fsSL -H 'Cache-Control: no-cache' --max-time 60 -o "$TMP/mr.sh"     "$RAW/mr.sh"     || { err "下载 mr.sh 失败"; exit 1; }
+curl -fsSL -H 'Cache-Control: no-cache' --max-time 60 -o "$TMP/mr-api.py" "$RAW/mr-api.py" || { err "下载 mr-api.py 失败"; exit 1; }
+
+# raw.githubusercontent 有 CDN 缓存，刚发布的版本可能取到旧内容；用 codeload 兜底
+if [ -n "$RV" ] && ! grep -q "SCRIPT_VERSION=\"$RV\"" "$TMP/mr.sh" 2>/dev/null; then
+    warn "raw 取到的不是 v$RV（CDN 缓存），改用 codeload 直取 ..."
+    if curl -fsSL --max-time 120 -o "$TMP/src.tar.gz" \
+        "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" 2>/dev/null; then
+        mkdir -p "$TMP/src"
+        tar -xzf "$TMP/src.tar.gz" -C "$TMP/src" 2>/dev/null
+        SRC_DIR="$(find "$TMP/src" -maxdepth 1 -type d -name '*multiroute*' | head -1)"
+        [ -n "$SRC_DIR" ] && cp -f "$SRC_DIR/mr.sh" "$TMP/mr.sh" && cp -f "$SRC_DIR/mr-api.py" "$TMP/mr-api.py" \
+            && info "已从 codeload 取到最新版本"
+    fi
+fi
 
 bash -n "$TMP/mr.sh" 2>/dev/null || { err "mr.sh 语法校验失败，已中止"; exit 1; }
 python3 -c "import py_compile; py_compile.compile('$TMP/mr-api.py', doraise=True)" >/dev/null 2>&1 \

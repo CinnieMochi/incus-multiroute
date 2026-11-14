@@ -984,6 +984,20 @@ update_menu() {
     if ! bash -n "$tmp/mr.sh"; then
         err "新脚本语法校验失败，已放弃（当前版本未受影响）"; rm -rf "$tmp"; pause_back; return 1
     fi
+    if ! grep -q "SCRIPT_VERSION=\"$rv\"" "$tmp/mr.sh" 2>/dev/null; then
+        warn "raw 取到的仍是旧版本（CDN 缓存），改用 codeload 直取 ..."
+        if curl -fsSL --max-time 120 -o "$tmp/src.tar.gz" \
+            "https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH" 2>/dev/null; then
+            mkdir -p "$tmp/src"
+            tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" 2>/dev/null
+            local sd
+            sd="$(find "$tmp/src" -maxdepth 1 -type d -name '*multiroute*' | head -1)"
+            [ -n "$sd" ] && cp -f "$sd/mr.sh" "$tmp/mr.sh" && cp -f "$sd/mr-api.py" "$tmp/mr-api.py" 2>/dev/null
+        fi
+        if ! grep -q "SCRIPT_VERSION=\"$rv\"" "$tmp/mr.sh" 2>/dev/null; then
+            err "仍取不到 v$rv，已放弃（当前版本未受影响）"; rm -rf "$tmp"; pause_back; return 1
+        fi
+    fi
     cp -f "$SELF_PATH" "$SELF_PATH.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
     install -m 755 "$tmp/mr.sh" /usr/local/bin/mr
     if curl -fsSL --max-time 60 -o "$tmp/mr-api.py" "$UPDATE_BASE/mr-api.py" 2>/dev/null; then
