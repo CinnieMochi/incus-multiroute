@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.3.7
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.3.7"
+SCRIPT_VERSION="1.4.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1299,6 +1299,28 @@ exit_add() {
         *) err "无效选择"; pause_back; return 1 ;;
     esac
 
+    # 依赖前置检查：缺客户端就不再往下问
+    case "$proto" in
+        ss|ss2022)
+            if ! sslocal_installed; then
+                err "还没有安装 shadowsocks-rust 客户端（sslocal）"
+                info "请先到 菜单 [14] → [3] 安装，装完再回来新增 $proto 出口"
+                info "或在 菜单 [14] → [4] 一次装齐所有依赖"
+                pause_back
+                return 1
+            fi
+            ;;
+        wg)
+            if ! wg_installed; then
+                err "还没有安装 wireguard-tools"
+                info "请先到 菜单 [14] → [2] 安装，装完再回来新增 WireGuard 出口"
+                info "或在 菜单 [14] → [4] 一次装齐所有依赖"
+                pause_back
+                return 1
+            fi
+            ;;
+    esac
+
     printf '名称（如 香港-01，输入 0 返回）: '; read -r name
     case "$name" in 0|"") info "已取消"; return 0 ;; esac
     [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
@@ -1360,39 +1382,158 @@ exit_add() {
     pause_back
 }
 
+# ---------------------------------------------------------------- 编号选择辅助
+
+exit_set_enable() {
+    # $1=出口名 $2=1/0
+    local want="$1" val="$2" l a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12
+    : > "$EXITS_CONF.tmp"
+    while IFS= read -r l; do
+        case "$l" in ''|'#'*) printf '%s\n' "$l" >> "$EXITS_CONF.tmp"; continue ;; esac
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 <<< "$l"
+        if [ "$a1" = "$want" ]; then
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" >> "$EXITS_CONF.tmp"
+        else
+            printf '%s\n' "$l" >> "$EXITS_CONF.tmp"
+        fi
+    done < "$EXITS_CONF"
+    mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
+}
+
+exits_print_numbered() {
+    # $1 = 把名称按顺序写入的文件
+    local idx=1 l name proto host port meth pass mark wgkey wgif local expect enable st
+    : > "$1"
+    while IFS= read -r l; do
+        case "$l" in ''|'#'*) continue ;; esac
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable <<< "$l"
+        [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
+        printf '  %s%2s%s  %-16s %-8s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$proto" "$host" "$port" "$mark" "$st"
+        printf '%s\n' "$name" >> "$1"
+        idx=$((idx + 1))
+    done < "$EXITS_CONF"
+}
+
+containers_print_numbered() {
+    # $1 = 把容器名按顺序写入的文件
+    local idx=1 n ip b
+    : > "$1"
+    while IFS=$'\t' read -r n ip; do
+        [ -n "$n" ] || continue
+        b="$(bind_get "$n" 2>/dev/null | awk -F'|' '{print $3}')"
+        [ -n "$b" ] || b="入口机"
+        printf '  %s%2s%s  %-22s %-16s %s\n' "$GREEN" "$idx" "$NC" "$n" "$ip" "$b"
+        printf '%s\n' "$n" >> "$1"
+        idx=$((idx + 1))
+    done <<< "$(containers_scan 2>/dev/null)"
+}
+
+exits_show_table() {
+    local f
+    f="$(mktemp)"
+    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    subline
+    exits_print_numbered "$f"
+    rm -f "$f"
+}
+
 exit_del() {
-    local name
+    local f n name
     clear_if_tty
     title "删除出口节点"
-    exits_each show_exit_row
+    f="$(mktemp)"
+    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
     subline
-    printf '请输入要删除的出口名称（0 返回）: '
-    read -r name
-    [ "$name" = "0" ] && return 0
-    exit_exists "$name" || { err "出口不存在"; pause_back; return 1; }
+    exits_print_numbered "$f"
+    subline
+    printf '  输入编号 ：删除该出口\n'
+    printf '  输入 99  ：删除全部出口\n'
+    printf '  输入 0   ：返回\n'
+    printf '请输入: '
+    read -r n
+    case "$n" in
+        0|"") rm -f "$f"; return 0 ;;
+        99)
+            printf ' 确认删除全部 %s 个出口? 输入 yes: ' "$(exits_count)"
+            read -r a
+            [ "$a" = "yes" ] || { info "已取消"; rm -f "$f"; return 0; }
+            printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用' > "$EXITS_CONF"
+            printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
+            apply_all >/dev/null 2>&1
+            ok "已删除全部出口，相关绑定已清空"
+            pause_back
+            rm -f "$f"
+            return 0
+            ;;
+    esac
+    case "$n" in *[!0-9]*) err "请输入编号"; rm -f "$f"; pause_back; return 1 ;; esac
+    name="$(sed -n "${n}p" "$f")"
+    rm -f "$f"
+    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
     grep -v "^$name|" "$EXITS_CONF" > "$EXITS_CONF.tmp"
     mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
-    awk -F'|' -v n="$name" '$4!=n' "$BIND_CONF" > "$BIND_CONF.tmp" 2>/dev/null || :
+    awk -F'|' -v n="$name" '$3!=n' "$BIND_CONF" > "$BIND_CONF.tmp" 2>/dev/null || :
     mv -f "$BIND_CONF.tmp" "$BIND_CONF"
     ok "已删除 $name，相关绑定已解除"
+    apply_all >/dev/null 2>&1
     pause_back
 }
 
 show_exit_row() {
     local name="$1" proto="$2" host="$3" port="$4" m="$5" pw="$6" mark="$7" wgkey="$8" wgif="$9" local="${10}" expect="${11}" enable="${12}"
     local st
-    [ "$enable" = "0" ] && st="${YELLOW}停用$NC" || st="${GREEN}启用$NC"
+    [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
     printf '  %-14s %-8s %-20s %-6s %-8s %s\n' "$name" "$proto" "$host" "$port" "$mark" "$st"
 }
 
 exits_list() {
-    title "出口节点"
-    printf '  %-14s %-8s %-20s %-6s %-8s %s\n' "名称" "协议" "地址" "端口" "mark" "状态"
-    subline
-    exits_each show_exit_row
-    subline
-    info "共 $(exits_count) 个出口"
-    pause_back
+    local f n name cur all
+    while :; do
+        clear_if_tty
+        title "出口节点（启用开关）"
+        f="$(mktemp)"
+        printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+        subline
+        exits_print_numbered "$f"
+        subline
+        printf '  输入编号：切换该出口 启用/停用（停用后用户端不再显示）\n'
+        printf '  输入 66  ：关闭全部节点\n'
+        printf '  输入 0   ：返回\n'
+        printf '请输入: '
+        read -r n
+        case "$n" in
+            0|"") rm -f "$f"; return 0 ;;
+            66)
+                printf ' 确认停用全部 %s 个出口? 输入 yes: ' "$(exits_count)"
+                read -r all
+                if [ "$all" = "yes" ]; then
+                    while IFS= read -r name; do
+                        [ -n "$name" ] && exit_set_enable "$name" 0
+                    done < "$f"
+                    rm -f "$f"
+                    apply_all >/dev/null 2>&1
+                    ok "已停用全部出口"
+                    pause_back
+                    continue
+                fi
+                info "已取消"; rm -f "$f"; continue
+                ;;
+        esac
+        case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; sleep 1; continue ;; esac
+        name="$(sed -n "${n}p" "$f")"
+        rm -f "$f"
+        [ -n "$name" ] || { err "无效编号"; sleep 1; continue; }
+        cur="$(exit_fld "$(exit_get "$name")" 12)"
+        if [ "$cur" = "0" ]; then
+            exit_set_enable "$name" 1
+            ok "$name 已启用"
+        else
+            exit_set_enable "$name" 0
+            ok "$name 已停用（用户端不再显示）"
+        fi
+        apply_all >/dev/null 2>&1
+        sleep 1
+    done
 }
 
 exit_test_one() {
@@ -1427,54 +1568,84 @@ exit_test_one() {
 }
 
 exit_test_menu() {
-    local name
+    local f n name
     clear_if_tty
     title "测试出口连通性"
-    exits_each show_exit_row >/dev/null 2>&1
-    printf '直接输入名称测试单个，或输入 all 全部测试（0 返回）: '
-    read -r name
-    [ "$name" = "0" ] && return 0
-    if [ "$name" = "all" ]; then
-        exits_each exit_test_one
-    else
-        exit_exists "$name" || { err "出口不存在"; pause_back; return 1; }
-        exit_test_one "$name"
-    fi
+    f="$(mktemp)"
+    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    subline
+    exits_print_numbered "$f"
+    subline
+    printf '  输入编号：测试该出口    输入 all：测试全部    输入 0：返回\n'
+    printf '请输入: '
+    read -r n
+    case "$n" in
+        0|"") rm -f "$f"; return 0 ;;
+        all|ALL)
+            subline
+            while IFS= read -r name; do
+                [ -n "$name" ] && exit_test_one "$name"
+            done < "$f"
+            rm -f "$f"; pause_back; return 0
+            ;;
+    esac
+    case "$n" in *[!0-9]*) err "请输入编号或 all"; rm -f "$f"; pause_back; return 1 ;; esac
+    name="$(sed -n "${n}p" "$f")"
+    rm -f "$f"
+    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    subline
+    exit_test_one "$name"
     pause_back
 }
 
 # ---------------------------------------------------------------- 绑定菜单
 
 containers_list() {
-    local n ip b
-    title "容器列表"
-    printf '  %-22s %-16s %s\n' "容器" "IPv4" "当前出口"
+    local f
+    title "容器列表（含当前出口）"
+    f="$(mktemp)"
+    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口"
     subline
-    while IFS=$'\t' read -r n ip; do
-        [ -n "$n" ] || continue
-        b="$(bind_get "$n" 2>/dev/null | awk -F'|' '{print $3}')"
-        [ -n "$b" ] || b="入口机"
-        printf '  %-22s %-16s %s\n' "$n" "$ip" "$b"
-    done <<< "$(containers_scan 2>/dev/null)"
+    containers_print_numbered "$f"
     subline
+    rm -f "$f"
     pause_back
 }
 
 bind_menu_choose() {
-    local n e
+    local cf ef n e name exit_name
     clear_if_tty
     title "绑定容器到出口"
-    printf '可选出口：\n'
-    exits_each show_exit_row
+    cf="$(mktemp)"
+    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口"
     subline
-    printf '容器名（输入 0 返回）: '; read -r n
-    case "$n" in 0|"") info "已取消"; return 1 ;; esac
-    printf '出口名（输入 入口机 表示直出，0 返回）: '; read -r e
-    case "$e" in 0|"") info "已取消"; return 1 ;; esac
-    if [ "$e" = "入口机" ] || [ "$e" = "-" ]; then
-        bind_remove "$n"
+    containers_print_numbered "$cf"
+    subline
+    printf ' 输入容器编号（0 返回）: '; read -r n
+    case "$n" in 0|"") rm -f "$cf"; info "已取消"; return 1 ;; esac
+    case "$n" in *[!0-9]*) rm -f "$cf"; err "请输入编号"; pause_back; return 1 ;; esac
+    name="$(sed -n "${n}p" "$cf")"
+    rm -f "$cf"
+    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+
+    clear_if_tty
+    ef="$(mktemp)"
+    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    subline
+    exits_print_numbered "$ef"
+    subline
+    printf '  输入出口编号；输入 0 = 入口机直出；直接回车 = 取消\n'
+    printf '请输入: '; read -r e
+    case "$e" in "") rm -f "$ef"; info "已取消"; return 1 ;; esac
+    case "$e" in *[!0-9]*) rm -f "$ef"; err "请输入编号"; pause_back; return 1 ;; esac
+    if [ "$e" = "0" ]; then
+        rm -f "$ef"
+        bind_clear "$name"
     else
-        bind_set "$n" "$e" || { pause_back; return 1; }
+        exit_name="$(sed -n "${e}p" "$ef")"
+        rm -f "$ef"
+        [ -n "$exit_name" ] || { err "无效编号"; pause_back; return 1; }
+        bind_set "$name" "$exit_name" || { pause_back; return 1; }
     fi
     bindings_refresh
     apply_all
@@ -1482,21 +1653,46 @@ bind_menu_choose() {
 }
 
 bind_menu_remove() {
-    local n
+    local f n name
     clear_if_tty
-    title "解除容器绑定"
-    containers_scan 2>/dev/null | while IFS=$'\t' read -r n ip; do
-        [ -n "$n" ] && printf '  %-22s %s\n' "$n" "$ip"
-    done
+    title "解除容器绑定（回到入口机直出）"
+    f="$(mktemp)"
+    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口"
     subline
-    printf '容器名（输入 0 返回）: '; read -r n
-    case "$n" in 0|"") info "已取消"; return 0 ;; esac
-    bind_clear "$n"
+    containers_print_numbered "$f"
+    subline
+    printf ' 输入容器编号（0 返回）: '; read -r n
+    case "$n" in 0|"") rm -f "$f"; info "已取消"; return 0 ;; esac
+    case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; pause_back; return 1 ;; esac
+    name="$(sed -n "${n}p" "$f")"
+    rm -f "$f"
+    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    bind_clear "$name"
     apply_all
     pause_back
 }
 
 # ---------------------------------------------------------------- 用户端菜单
+
+pick_container() {
+    # $1=标题 $3=无效时行为(忽略)，成功时把容器名 echo 出去
+    local title_txt="$1" f n name
+    clear_if_tty
+    title "$title_txt"
+    f="$(mktemp)"
+    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口"
+    subline
+    containers_print_numbered "$f"
+    subline
+    printf ' 输入容器编号（0 返回）: '
+    read -r n
+    case "$n" in 0|"") rm -f "$f"; info "已取消"; return 1 ;; esac
+    case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; pause_back; return 1 ;; esac
+    name="$(sed -n "${n}p" "$f")"
+    rm -f "$f"
+    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    printf '%s\n' "$name"
+}
 
 client_menu() {
     while true; do
@@ -1523,10 +1719,8 @@ client_menu() {
         read -r c
         case "$c" in
             1) client_status; pause_back ;;
-            2) printf '容器名（输入 0 返回）: '; read -r cn
-               case "$cn" in 0|"") info "已取消" ;; *) client_grant "$cn" ;; esac ;;
-            3) printf '容器名（输入 0 返回）: '; read -r cn
-               case "$cn" in 0|"") info "已取消" ;; *) client_revoke "$cn" ;; esac ;;
+            2) CN="$(pick_container "授权并下发" 1)" && [ -n "$CN" ] && client_grant "$CN" ;;
+            3) CN="$(pick_container "撤销授权并回收" 3)" && [ -n "$CN" ] && client_revoke "$CN" ;;
             4) client_grant_all ;;
             5) client_revoke_all ;;
             6) client_sync ;;

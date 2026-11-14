@@ -81,11 +81,41 @@ def load_allow():
     return out
 
 
+_LOOKUP = {"ts": 0.0, "map": {}}
+
+
+def incus_ip_map():
+    """从 incus 实时取 容器IP -> 容器名 映射（5 秒缓存）。
+
+    绑定表里没有记录时用它兜底，避免"授权了但没绑定"就直接 403。
+    """
+    now = time.time()
+    if now - _LOOKUP["ts"] < 5 and _LOOKUP["map"]:
+        return _LOOKUP["map"]
+    m = {}
+    try:
+        out = subprocess.run(["incus", "list", "--format=csv", "-c", "n4"],
+                             capture_output=True, timeout=10).stdout
+        for line in out.decode("utf-8", "ignore").splitlines():
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            ip = parts[1].split(" (")[0].strip()
+            name = parts[0].strip()
+            if ip and name:
+                m[ip] = name
+    except Exception:  # noqa: BLE001
+        return _LOOKUP["map"]
+    _LOOKUP["ts"] = now
+    _LOOKUP["map"] = m
+    return m
+
+
 def container_by_ip(ip):
     for name, b in load_bindings().items():
         if b["ip"] == ip:
             return name
-    return None
+    return incus_ip_map().get(ip)
 
 
 def exit_display(name):
