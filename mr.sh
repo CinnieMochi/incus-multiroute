@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.3.4
+# Incus MultiRoute 宿主机出口管理脚本 v1.3.5
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -516,7 +516,7 @@ client_inject_api_url() {
     gw="${SUBNET_GW:-}"
     [ -n "$gw" ] || gw="$(detect_gateway)"
     [ -n "$gw" ] || { warn "未探测到网桥网关，用户端 API 地址保持原样"; return 1; }
-    sed -i "s|10\.10\.0\.1:18988|$gw:18988|g" "$CLIENT_BASE"
+    sed -i -E "s|[0-9]{1,3}(\.[0-9]{1,3}){3}:18988|$gw:18988|g" "$CLIENT_BASE"
     info "用户端 API 地址已指向 $gw:18988"
 }
 

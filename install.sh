@@ -109,11 +109,12 @@ if curl -fsSL --max-time 60 -o "$DATA_DIR/client/out.tmp" "$RAW/client/out" 2>/d
     GW="$(incus network list --format=csv 2>/dev/null | awk -F, '$2=="bridge"{print $1; exit}')"
     [ -n "$GW" ] || GW="incusbr0"
     ADDR="$(ip -4 -o addr show dev "$GW" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
-    if [ -n "$ADDR" ] && [ "$ADDR" != "10.10.0.1" ]; then
-        sed -i "s|10\.10\.0\.1:18988|$ADDR:18988|g" "$DATA_DIR/client/out"
+    # 把用户端脚本里的默认 API 地址统一替换成本机网桥网关（不写死任何具体地址）
+    if [ -n "$ADDR" ]; then
+        sed -i -E "s|[0-9]{1,3}(\.[0-9]{1,3}){3}:18988|$ADDR:18988|g" "$DATA_DIR/client/out"
         info "用户端 API 地址已指向 $ADDR:18988"
     else
-        info "网桥地址为 10.10.0.1，用户端脚本保持原样"
+        warn "未探测到网桥网关，用户端 API 地址保持脚本默认值"
     fi
     sha256sum "$DATA_DIR/client/out" | awk '{print $1}' > "$CONF_DIR/client.sha256"
 else
