@@ -67,6 +67,29 @@ install -m 755 "$TMP/mr-api.py" /usr/local/bin/mr-api.py
 
 mkdir -p "$CONF_DIR" "$DATA_DIR/client"
 
+info "配置用户端 API 服务 ..."
+PYBIN="$(command -v python3 || echo /usr/bin/python3)"
+cat > /etc/systemd/system/mr-api.service <<EOF
+[Unit]
+Description=Incus MultiRoute 用户端 API
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$PYBIN /usr/local/bin/mr-api.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+if systemctl enable --now mr-api >/dev/null 2>&1; then
+    ok "API 服务已启动（开机自启）"
+else
+    warn "API 服务启动失败，可稍后在菜单 [12] 手动处理"
+fi
+
 info "准备用户端 out 基准脚本 ..."
 if curl -fsSL --max-time 60 -o "$DATA_DIR/client/out.tmp" "$RAW/client/out" 2>/dev/null; then
     mv -f "$DATA_DIR/client/out.tmp" "$DATA_DIR/client/out"

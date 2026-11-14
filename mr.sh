@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.3.0
+# Incus MultiRoute 宿主机出口管理脚本 v1.3.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1607,6 +1607,8 @@ install_self() {
     else
         warn "同目录未找到 mr-api.py，API 服务不可用"
     fi
+    api_install_unit
+    systemctl enable --now mr-api >/dev/null 2>&1 || true
     if [ -f "$d/out" ]; then
         cp -f "$d/out" "$CLIENT_BASE"
         chmod 755 "$CLIENT_BASE"
