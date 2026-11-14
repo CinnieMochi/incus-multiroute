@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.6
+# Incus MultiRoute 宿主机出口管理脚本 v2.0.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -377,7 +377,10 @@ apply_wg_one() {
     chmod 600 "$DATA_DIR/wg.key"
     [ -n "$local" ] && ip addr replace "$local" dev "$wgif"
     ip link set mtu 1420 up dev "$wgif"
-    wg set "$wgif" private-key "$DATA_DIR/wg.key" peer "$wgkey" endpoint "$host:$port" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+    # IPv6 端点必须写成 [addr]:port，否则 wg 解析失败
+    local ep="$host:$port"
+    case "$host" in *:*) ep="[$host]:$port" ;; esac
+    wg set "$wgif" private-key "$DATA_DIR/wg.key" peer "$wgkey" endpoint "$ep" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     table="$(wg_table "$name")"
     ip rule del fwmark "$mark" table "$table" 2>/dev/null || true
     ip rule add fwmark "$mark" table "$table" priority "$((1000 + table - 10000))"
@@ -1278,6 +1281,9 @@ doctor() {
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
+    if ip -6 route show default 2>/dev/null | grep -q default; then
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机有 IPv6 出网" "容器 IPv6 流量不会走出口（只代理 IPv4），如需隐藏请禁用容器 IPv6"
+    fi
     if [ "$(ss_enabled_count 2>/dev/null)" -gt 0 ] 2>/dev/null; then
         if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "0" ]; then
             check_item "br_netfilter 已关闭" 0 "TPROXY 必需"
@@ -1432,8 +1438,17 @@ exit_add() {
     [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
     exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
 
-    printf '服务器地址（输入 0 返回）: '; read -r host
+    printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回）: '; read -r host
     case "$host" in 0|"") info "已取消"; return 0 ;; esac
+    case "$host" in
+        [*]) host="$(printf '%s' "$host" | tr -d '[]')" ;;
+    esac
+    case "$host" in
+        *:*)
+            warn "这是一个 IPv6 地址：宿主机必须已有可用的 IPv6 出网，否则该出口无法连接"
+            info "容器侧仍然是 IPv4（10.10.0.0/22），只有宿主机到落地机这一段走 IPv6"
+            ;;
+    esac
 
     if [ "$proto" = "wg" ]; then
         info "WireGuard 的加密算法是协议固定的（ChaCha20-Poly1305），无需选择"
