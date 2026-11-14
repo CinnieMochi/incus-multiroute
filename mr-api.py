@@ -100,8 +100,8 @@ def incus_ip_map():
             parts = line.split(",")
             if len(parts) < 2:
                 continue
-            ip = parts[1].split(" (")[0].strip()
-            name = parts[0].strip()
+            ip = parts[1].replace('"', "").split(" (")[0].strip().split(" ")[0]
+            name = parts[0].replace('"', "").strip()
             if ip and name:
                 m[ip] = name
     except Exception:  # noqa: BLE001

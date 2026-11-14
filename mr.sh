@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.0
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -215,7 +215,12 @@ bindings_each() {
 containers_scan() {
     # 输出：容器名<TAB>IPv4
     has_cmd incus || return 1
-    incus list --format=csv -c n4 2>/dev/null | awk -F, '{ip=$2; sub(/ *\(.*/,"",ip); if (ip != "") printf "%s\t%s\n", $1, ip}'
+    # CSV 里带引号或 "(eth0)" 后缀时要清洗：去掉引号、括号后缀，多地址取第一个
+    incus list --format=csv -c n4 2>/dev/null | awk -F, '{
+        n = $1; gsub(/"/, "", n)
+        ip = $2; gsub(/"/, "", ip); sub(/ *\(.*/, "", ip); split(ip, a, " "); ip = a[1]
+        if (ip != "") printf "%s\t%s\n", n, ip
+    }'
 }
 
 container_ip() {
