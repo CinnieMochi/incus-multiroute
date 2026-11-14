@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.2
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.3
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1492,7 +1492,7 @@ show_exit_row() {
 }
 
 exits_list() {
-    local f n name cur all
+    local f n name cur
     while :; do
         clear_if_tty
         title "出口节点（启用开关）"
@@ -1502,27 +1502,11 @@ exits_list() {
         exits_print_numbered "$f"
         subline
         printf '  输入编号：切换该出口 启用/停用（停用后用户端不再显示）\n'
-        printf '  输入 66  ：关闭全部节点\n'
         printf '  输入 0   ：返回\n'
         printf '请输入: '
         read -r n
         case "$n" in
             0|"") rm -f "$f"; return 0 ;;
-            66)
-                printf ' 确认停用全部 %s 个出口? 输入 yes: ' "$(exits_count)"
-                read -r all
-                if [ "$all" = "yes" ]; then
-                    while IFS= read -r name; do
-                        [ -n "$name" ] && exit_set_enable "$name" 0
-                    done < "$f"
-                    rm -f "$f"
-                    apply_all >/dev/null 2>&1
-                    ok "已停用全部出口"
-                    pause_back
-                    continue
-                fi
-                info "已取消"; rm -f "$f"; continue
-                ;;
         esac
         case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; sleep 1; continue ;; esac
         name="$(sed -n "${n}p" "$f")"
