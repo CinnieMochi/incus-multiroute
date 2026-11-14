@@ -5,14 +5,14 @@
 # 风格：与 lxc.sh（Shlii-Incus 容器管理）保持一致
 #
 # 目录：
-#   /etc/shlii-egress        配置（出口、绑定、令牌、用户端脚本基准）
-#   /var/lib/shlii-egress    数据（渲染产物、日志）
+#   /etc/incus-multiroute        配置（出口、绑定、令牌、用户端脚本基准）
+#   /var/lib/incus-multiroute    数据（渲染产物、日志）
 #
 # 非交互命令（供 cron / systemd 调用）：
-#   egress apply      重新下发全部规则
-#   egress refresh    按 incus 实际状态校正容器 IP
-#   egress sync       校验并下发用户端 out（缺失/不一致则推送）
-#   egress doctor     环境体检
+#   mr apply      重新下发全部规则
+#   mr refresh    按 incus 实际状态校正容器 IP
+#   mr sync       校验并下发用户端 out（缺失/不一致则推送）
+#   mr doctor     环境体检
 #
 
 RED='\033[0;31m'
@@ -24,9 +24,9 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
-CONF_DIR="/etc/shlii-egress"
-DATA_DIR="/var/lib/shlii-egress"
-MAIN_CONF="$CONF_DIR/egress.conf"
+CONF_DIR="/etc/incus-multiroute"
+DATA_DIR="/var/lib/incus-multiroute"
+MAIN_CONF="$CONF_DIR/mr.conf"
 EXITS_CONF="$CONF_DIR/exits.conf"
 BIND_CONF="$CONF_DIR/bindings.conf"
 TOKEN_CONF="$CONF_DIR/tokens.conf"
@@ -34,14 +34,14 @@ SS_DIR="$CONF_DIR/sslocal"
 CLIENT_BASE="$DATA_DIR/client/out"
 CLIENT_HASH="$CONF_DIR/client.sha256"
 CLIENT_ALLOW_CONF="$CONF_DIR/clients.conf"
-NFT_FILE="$DATA_DIR/egress.nft"
+NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
-API_PY="/usr/local/bin/egress-api.py"
+API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 REPO_OWNER="CinnieMochi"
-REPO_NAME="incushlii-egress"
+REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
 UPDATE_BASE="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REPO_BRANCH"
 
@@ -122,7 +122,7 @@ init_main_conf() {
     [ -n "$b" ] || b="incusbr0"
     gw="$(ip -4 -o addr show dev "$b" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
     {
-        echo '# Shlii-Egress 主配置'
+        echo '# Incus MultiRoute 主配置'
         echo "BRIDGE="$b""
         echo "SUBNET_GW="$gw""
         echo 'TPROXY_BASE="41000"'
@@ -254,6 +254,24 @@ bind_set() {
     ok "已绑定 $name -> $exit_name"
 }
 
+bind_clear() {
+    # 只清空出口与 mark，保留行 ---- 否则容器会因"未识别来源"而再也切不回来
+    local name="$1" ip
+    ip="$(bind_get "$name" 2>/dev/null | awk -F'|' '{print $2}')"
+    [ -n "$ip" ] || ip="$(container_ip "$name")"
+    : > "$BIND_CONF.tmp"
+    while IFS= read -r l; do
+        case "$l" in ''|'#'*) printf '%s\n' "$l" >> "$BIND_CONF.tmp"; continue ;; esac
+        if [ "${l%%|*}" = "$name" ]; then
+            printf '%s|%s||\n' "$name" "$ip" >> "$BIND_CONF.tmp"
+        else
+            printf '%s\n' "$l" >> "$BIND_CONF.tmp"
+        fi
+    done < "$BIND_CONF"
+    mv -f "$BIND_CONF.tmp" "$BIND_CONF"
+    ok "$name 已切回入口机直出"
+}
+
 bind_remove() {
     local name="$1"
     : > "$BIND_CONF.tmp"
@@ -287,10 +305,10 @@ bindings_refresh() {
 gen_nft() {
     local elems="" redirs="" l cb
     local ts="$(date +%Y-%m-%d\ %H:%M:%S)"
-    elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
+    elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
     {
-        echo "# 由 shlii-egress 生成于 $ts —— 请勿手改"
-        echo 'table inet egress {'
+        echo "# 由 Incus MultiRoute 生成于 $ts —— 请勿手改"
+        echo 'table inet multiroute {'
         echo '    set bypass4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } }'
         if [ -n "$elems" ]; then
             echo "    map c_ip { type ipv4_addr : mark; elements = {$elems } }"
@@ -370,13 +388,29 @@ wg_table() {
     echo 10999
 }
 
+ensure_wg_key() {
+    local k pub a
+    [ -n "$WG_PRIVATE_KEY" ] && return 0
+    has_cmd wg || { err "需要先安装 wireguard-tools（菜单 14 -> 2）"; return 1; }
+    printf ' 尚未生成宿主机 wg 私钥，现在生成? [Y/n]: '
+    read -r a
+    case "$a" in [nN]) err "已取消"; return 1 ;; esac
+    k="$(wg genkey 2>/dev/null)"
+    [ -n "$k" ] || { err "生成失败"; return 1; }
+    pub="$(printf '%s' "$k" | wg pubkey 2>/dev/null)"
+    save_main_var WG_PRIVATE_KEY "$k"
+    WG_PRIVATE_KEY="$k"
+    ok "已生成并保存宿主机 wg 私钥"
+    printf ' %s宿主机公钥%s（填进出口机 wg 配置的 [Peer] PublicKey）:\n  %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$pub" "$NC"
+}
+
 apply_ss_units() {
     local name proto host port method pass enable l cmd
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable <<< "$l"
         case "$proto" in ss|ss2022) ;; *) continue ;; esac
-        local u="shlii-egress-ss-$name.service"
+        local u="mr-ss-$name.service"
         if [ "$enable" = "0" ]; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
             continue
@@ -397,7 +431,7 @@ EOF
         chmod 600 "$SS_DIR/$name.json"
         cat > "$UNIT_DIR/$u" <<EOF
 [Unit]
-Description=Shlii-Egress sslocal ($name)
+Description=Incus MultiRoute sslocal ($name)
 After=network-online.target
 Wants=network-online.target
 
@@ -415,6 +449,18 @@ EOF
         systemctl enable "$u" >/dev/null 2>&1 || true
         systemctl restart "$u" >/dev/null 2>&1 || warn "$name: sslocal 启动失败，检查 $SS_CLIENT_CMD"
     done < "$EXITS_CONF"
+    # 清理已删除出口遗留的单元
+    local f n
+    for f in "$UNIT_DIR"/mr-ss-*.service; do
+        [ -e "$f" ] || continue
+        n="$(basename "$f" .service)"
+        n="${n#mr-ss-}"
+        if ! exit_exists "$n"; then
+            systemctl disable --now "mr-ss-$n.service" >/dev/null 2>&1 || true
+            rm -f "$f"
+            info "已清理失效单元: mr-ss-$n.service"
+        fi
+    done
 }
 
 apply_all() {
@@ -422,7 +468,7 @@ apply_all() {
     require_root
     title "下发规则"
     gen_nft
-    nft delete table inet egress 2>/dev/null || true
+    nft delete table inet multiroute 2>/dev/null || true
     if nft -f "$NFT_FILE"; then
         ok "nft 规则已加载"
     else
@@ -646,15 +692,15 @@ sync_timer_on() {
     if [ "$(allowed_count)" = "0" ]; then
         warn "尚未授权任何用户，定时器开启后也不会有任何下发动作"
     fi
-    cat > "$UNIT_DIR/shlii-egress-sync.service" <<EOF
+    cat > "$UNIT_DIR/mr-sync.service" <<EOF
 [Unit]
-Description=Shlii-Egress 用户端 out 校验下发
+Description=Incus MultiRoute 用户端 out 校验下发
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/egress sync
+ExecStart=/usr/local/bin/mr sync
 EOF
-    cat > "$UNIT_DIR/shlii-egress-sync.timer" <<EOF
+    cat > "$UNIT_DIR/mr-sync.timer" <<EOF
 [Unit]
 Description=每 10 分钟校验用户端 out
 
@@ -667,17 +713,17 @@ AccuracySec=30s
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now shlii-egress-sync.timer >/dev/null 2>&1
+    systemctl enable --now mr-sync.timer >/dev/null 2>&1
     ok "自动校验定时器已启用（每 10 分钟）"
 }
 
 sync_timer_off() {
-    systemctl disable --now shlii-egress-sync.timer >/dev/null 2>&1 || true
+    systemctl disable --now mr-sync.timer >/dev/null 2>&1 || true
     ok "自动校验定时器已停用"
 }
 
 sync_timer_state() {
-    if systemctl is-active --quiet shlii-egress-sync.timer 2>/dev/null; then
+    if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
         echo "已启用"
     else
         echo "未启用"
@@ -694,7 +740,7 @@ wg_iface_count() {
 }
 
 ss_active_units() {
-    systemctl list-units 'shlii-egress-ss-*.service' --state=running --no-legend --no-pager 2>/dev/null | wc -l | tr -d ' '
+    systemctl list-units 'mr-ss-*.service' --state=running --no-legend --no-pager 2>/dev/null | wc -l | tr -d ' '
 }
 
 comp_line() {
@@ -910,27 +956,27 @@ update_menu() {
     subline
     curl -fsSL --max-time 15 "$UPDATE_BASE/CHANGELOG.md" 2>/dev/null | head -20 || printf '  （无更新说明）\n'
     subline
-    printf ' 更新只替换 /usr/local/bin/egress 与 egress-api.py\n'
-    printf ' %s不会改动%s /etc/shlii-egress（出口/绑定/令牌/白名单）和 /var/lib/shlii-egress\n' "$GREEN" "$NC"
+    printf ' 更新只替换 /usr/local/bin/mr 与 mr-api.py\n'
+    printf ' %s不会改动%s /etc/incus-multiroute（出口/绑定/令牌/白名单）和 /var/lib/incus-multiroute\n' "$GREEN" "$NC"
     printf ' 继续更新? [y/N]: '
     read -r a
     case "$a" in [yY]) ;; *) info "已取消，未做任何改动"; pause_back; return 0 ;; esac
     tmp="$(mktemp -d)"
     info "下载新版本 ..."
-    if ! curl -fsSL --max-time 60 -o "$tmp/egress.sh" "$UPDATE_BASE/egress.sh"; then
+    if ! curl -fsSL --max-time 60 -o "$tmp/mr.sh" "$UPDATE_BASE/mr.sh"; then
         err "下载失败，已放弃（当前版本未受影响）"; rm -rf "$tmp"; pause_back; return 1
     fi
-    if ! bash -n "$tmp/egress.sh"; then
+    if ! bash -n "$tmp/mr.sh"; then
         err "新脚本语法校验失败，已放弃（当前版本未受影响）"; rm -rf "$tmp"; pause_back; return 1
     fi
     cp -f "$SELF_PATH" "$SELF_PATH.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    install -m 755 "$tmp/egress.sh" /usr/local/bin/egress
-    if curl -fsSL --max-time 60 -o "$tmp/egress-api.py" "$UPDATE_BASE/egress-api.py" 2>/dev/null; then
-        if python3 -c "import py_compile; py_compile.compile('$tmp/egress-api.py', doraise=True)" >/dev/null 2>&1; then
-            install -m 755 "$tmp/egress-api.py" /usr/local/bin/egress-api.py
-            systemctl is-active --quiet shlii-egress-api 2>/dev/null && systemctl restart shlii-egress-api
+    install -m 755 "$tmp/mr.sh" /usr/local/bin/mr
+    if curl -fsSL --max-time 60 -o "$tmp/mr-api.py" "$UPDATE_BASE/mr-api.py" 2>/dev/null; then
+        if python3 -c "import py_compile; py_compile.compile('$tmp/mr-api.py', doraise=True)" >/dev/null 2>&1; then
+            install -m 755 "$tmp/mr-api.py" /usr/local/bin/mr-api.py
+            systemctl is-active --quiet mr-api 2>/dev/null && systemctl restart mr-api
         else
-            warn "新的 egress-api.py 语法校验失败，已跳过（API 保持旧版本）"
+            warn "新的 mr-api.py 语法校验失败，已跳过（API 保持旧版本）"
         fi
     fi
     rm -rf "$tmp"
@@ -944,9 +990,9 @@ update_menu() {
 
 uninstall_all() {
     local ans name l proto wgif mark table
-    title "一键卸载 Shlii-Egress"
-    warn "将删除：nft 表 inet shlii_egress、wg 出口接口与策略路由、全部 shlii-egress-* 单元、"
-    warn "        /etc/shlii-egress、/var/lib/shlii-egress、/usr/local/bin/egress 与 egress-api.py"
+    title "一键卸载 Incus MultiRoute"
+    warn "将删除：nft 表 inet multiroute、wg 出口接口与策略路由、全部 mr-* 单元、"
+    warn "        /etc/incus-multiroute、/var/lib/incus-multiroute、/usr/local/bin/mr 与 mr-api.py"
     info "不会自动卸载 wireguard-tools / sslocal 二进制，也不会动 incus 与其它面板的表"
     subline
     printf ' %s第一次确认%s —— 输入 yes 继续，其它任意键取消: ' "$YELLOW" "$NC"
@@ -964,11 +1010,11 @@ uninstall_all() {
     info "开始卸载 ..."
 
     info "停止并清理服务单元 ..."
-    systemctl disable --now shlii-egress-sync.timer  >/dev/null 2>&1 || true
-    systemctl disable --now shlii-egress-api.service >/dev/null 2>&1 || true
+    systemctl disable --now mr-sync.timer  >/dev/null 2>&1 || true
+    systemctl disable --now mr-api.service >/dev/null 2>&1 || true
     while IFS='|' read -r name proto l; do
         case "$name" in ''|'#'*) continue ;; esac
-        systemctl disable --now "shlii-egress-ss-$name.service" >/dev/null 2>&1 || true
+        systemctl disable --now "mr-ss-$name.service" >/dev/null 2>&1 || true
     done < "$EXITS_CONF" 2>/dev/null
 
     info "清理 wg 接口与策略路由 ..."
@@ -983,7 +1029,7 @@ uninstall_all() {
     done < "$EXITS_CONF" 2>/dev/null
 
     info "删除 nft 表 ..."
-    nft delete table inet shlii_egress 2>/dev/null && ok "已删除 inet shlii_egress" || info "无 nft 表需要删除"
+    nft delete table inet multiroute 2>/dev/null && ok "已删除 inet multiroute" || info "无 nft 表需要删除"
 
     info "回收所有已授权容器的 out ..."
     local c
@@ -993,10 +1039,10 @@ uninstall_all() {
     done
 
     info "删除单元文件与目录 ..."
-    rm -f /etc/systemd/system/shlii-egress-*.service /etc/systemd/system/shlii-egress-*.timer
+    rm -f /etc/systemd/system/mr-*.service /etc/systemd/system/mr-*.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
     rm -rf "$CONF_DIR" "$DATA_DIR"
-    rm -f /usr/local/bin/egress /usr/local/bin/egress-api.py
+    rm -f /usr/local/bin/mr /usr/local/bin/mr-api.py
     subline
     ok "卸载完成（wireguard-tools / sslocal / incus 均未改动）"
     printf '\n'
@@ -1026,10 +1072,10 @@ doctor() {
     has_cmd wg;     check_item "wireguard-tools" "$?" "wg 出口依赖"
     [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; check_item "ip_forward=1" "$?" "转发必需"
     [ "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = "2" ]; check_item "rp_filter=2（loose）" "$?" "策略路由必需"
-    nft list table inet egress >/dev/null 2>&1; check_item "nft 表 inet egress" "$?" "未下发过规则时属于正常"
+    nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
-    systemctl is-active --quiet shlii-egress-sync.timer 2>/dev/null; check_item "自动校验定时器" "$?" "菜单 11 可开启"
+    systemctl is-active --quiet mr-sync.timer 2>/dev/null; check_item "自动校验定时器" "$?" "菜单 11 可开启"
     local conflict
     conflict="$(ip rule show 2>/dev/null | grep -oE 'fwmark 0x[0-9a-fA-F]+' | awk '{print $2}' | sort -u | grep -viE '^0x1[0-9a-fA-F]{3}$' | head -5 || true)"
     if [ -n "$conflict" ]; then
@@ -1060,14 +1106,14 @@ doctor() {
 # ---------------------------------------------------------------- API 服务
 
 api_install_unit() {
-    cat > "$UNIT_DIR/shlii-egress-api.service" <<EOF
+    cat > "$UNIT_DIR/mr-api.service" <<EOF
 [Unit]
-Description=Shlii-Egress 用户端 API
+Description=Incus MultiRoute 用户端 API
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/egress-api.py
+ExecStart=/usr/bin/python3 /usr/local/bin/mr-api.py
 Restart=always
 RestartSec=3
 
@@ -1082,7 +1128,7 @@ api_menu() {
     while true; do
         clear_if_tty
         title "API 服务管理"
-        printf '  %-20s %s\n' "状态" "$(systemctl is-active shlii-egress-api 2>/dev/null || true)"
+        printf '  %-20s %s\n' "状态" "$(systemctl is-active mr-api 2>/dev/null || true)"
         printf '  %-20s %s\n' "监听" "$(api_listen_addr)"
         subline
         printf '    %s[1]%s 安装服务单元\n' "$GREEN" "$NC"
@@ -1095,10 +1141,10 @@ api_menu() {
         read -r c
         case "$c" in
             1) api_install_unit; pause_back ;;
-            2) api_install_unit; systemctl restart shlii-egress-api; sleep 1
-               systemctl is-active --quiet shlii-egress-api && ok "已启动" || err "启动失败"; pause_back ;;
-            3) systemctl stop shlii-egress-api; ok "已停止"; pause_back ;;
-            4) journalctl -u shlii-egress-api -n 40 --no-pager; pause_back ;;
+            2) api_install_unit; systemctl restart mr-api; sleep 1
+               systemctl is-active --quiet mr-api && ok "已启动" || err "启动失败"; pause_back ;;
+            3) systemctl stop mr-api; ok "已停止"; pause_back ;;
+            4) journalctl -u mr-api -n 40 --no-pager; pause_back ;;
             0) return 0 ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
@@ -1133,7 +1179,8 @@ exit_add() {
     printf '服务器地址: '; read -r host
     if [ "$proto" = "wg" ]; then
         printf '端口 [51820]: '; read -r port; [ -n "$port" ] || port=51820
-        printf '服务器公钥: '; read -r wgkey
+        ensure_wg_key || { pause_back; return 1; }
+        printf '出口机公钥: '; read -r wgkey
         printf '本机接口名 [wg-exit1]: '; read -r wgif; [ -n "$wgif" ] || wgif="wg-exit$(($(exits_count) + 1))"
         printf '本机隧道地址（如 10.200.1.2/32）: '; read -r local
         method=""; pass=""
@@ -1206,7 +1253,7 @@ exit_test_one() {
             ;;
         ss|ss2022)
             local u port
-            u="shlii-egress-ss-$name.service"
+            u="mr-ss-$name.service"
             port="$(exit_ss_port "$name")"
             if systemctl is-active --quiet "$u" 2>/dev/null && ss -ltn 2>/dev/null | grep -q ":$port "; then
                 printf '  %-14s %s本地 %s 就绪（端到端请在容器内实测）%s\n' "$name" "$GREEN" "$port" "$NC"
@@ -1283,7 +1330,7 @@ bind_menu_remove() {
     subline
     printf '容器名: '; read -r n
     [ -n "$n" ] || return 0
-    bind_remove "$n"
+    bind_clear "$n"
     apply_all
     pause_back
 }
@@ -1357,7 +1404,7 @@ banner_status() {
     b_count="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | grep -c '|' || true)"
     c_count="$(containers_scan 2>/dev/null | grep -c '	' || true)"
     line
-    printf '        %sIncuShlii Egress 出口管理 v%s%s\n' "$CYAN" "$SCRIPT_VERSION" "$NC"
+    printf '        %sIncus MultiRoute 出口管理 v%s%s\n' "$CYAN" "$SCRIPT_VERSION" "$NC"
     line
     local os_name
     os_name="$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
@@ -1395,7 +1442,7 @@ menu_main() {
         printf '  %s【环境】%s\n' "$CYAN" "$NC"
         printf '    %s[14]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
         printf '    %s[16]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
-        printf '    %s[99]%s 一键卸载 Shlii-Egress\n' "$RED" "$NC"
+        printf '    %s[99]%s 一键卸载 Incus MultiRoute\n' "$RED" "$NC"
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
         line
@@ -1429,12 +1476,12 @@ menu_main() {
 install_self() {
     local d
     d="$(cd "$(dirname "$0")" && pwd)"
-    install -m 755 "$0" /usr/local/bin/egress
-    if [ -f "$d/egress-api.py" ]; then
-        install -m 755 "$d/egress-api.py" /usr/local/bin/egress-api.py
-        ok "API 服务已安装到 /usr/local/bin/egress-api.py"
+    install -m 755 "$0" /usr/local/bin/mr
+    if [ -f "$d/mr-api.py" ]; then
+        install -m 755 "$d/mr-api.py" /usr/local/bin/mr-api.py
+        ok "API 服务已安装到 /usr/local/bin/mr-api.py"
     else
-        warn "同目录未找到 egress-api.py，API 服务不可用"
+        warn "同目录未找到 mr-api.py，API 服务不可用"
     fi
     if [ -f "$d/out" ]; then
         cp -f "$d/out" "$CLIENT_BASE"
@@ -1447,21 +1494,21 @@ install_self() {
     fi
     warn "自动下发默认关闭：装完之后不会给任何容器推送 out"
     info "需要开给某个用户时：菜单 [9] -> [2] 授权并下发"
-    ok "安装完成，任意位置输入 egress 即可运行菜单"
+    ok "安装完成，任意位置输入 mr 即可运行菜单"
     pause_back
 }
 
 usage() {
     cat <<EOF
-Shlii-Egress 宿主机出口管理
+Incus MultiRoute 宿主机出口管理
 
 用法:
-  egress                    进入交互菜单
-  egress apply              重新下发全部规则
-  egress refresh            按 incus 实际状态校正容器 IP 后下发
-  egress sync               校验并下发用户端 out（供定时器调用）
-  egress doctor             环境体检
-  egress --install          安装到 /usr/local/bin/egress
+  mr                    进入交互菜单
+  mr apply              重新下发全部规则
+  mr refresh            按 incus 实际状态校正容器 IP 后下发
+  mr sync               校验并下发用户端 out（供定时器调用）
+  mr doctor             环境体检
+  mr --install          安装到 /usr/local/bin/mr
 
 配置目录: $CONF_DIR
 数据目录: $DATA_DIR

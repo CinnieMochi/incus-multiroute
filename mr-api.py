@@ -17,13 +17,13 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-CONF_DIR = "/etc/shlii-egress"
+CONF_DIR = "/etc/incus-multiroute"
 EXITS_CONF = os.path.join(CONF_DIR, "exits.conf")
 BIND_CONF = os.path.join(CONF_DIR, "bindings.conf")
 TOKEN_CONF = os.path.join(CONF_DIR, "tokens.conf")
 ALLOW_CONF = os.path.join(CONF_DIR, "clients.conf")
 API_CONF = os.path.join(CONF_DIR, "api.conf")
-EGRESS_BIN = "/usr/local/bin/egress"
+EGRESS_BIN = "/usr/local/bin/mr"
 
 LOCK = threading.Lock()
 RATE = {}
@@ -107,6 +107,30 @@ def write_binding(name, ip, exit_name, mark):
                 lines.append(line)
     if not replaced:
         lines.append("%s|%s|%s|%s" % (name, ip, exit_name, mark))
+    tmp = BIND_CONF + ".api.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, BIND_CONF)
+
+
+def clear_binding(name):
+    """保留行、只清空出口与 mark：否则该容器会因“未识别来源”而再也切不回来"""
+    lines = []
+    ip = ""
+    with open(BIND_CONF, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if line.startswith("#") or not line.strip():
+                lines.append(line)
+                continue
+            parts = line.split("|")
+            if parts[0] == name:
+                ip = parts[1] if len(parts) > 1 else ""
+                lines.append("%s|%s||" % (name, ip))
+            else:
+                lines.append(line)
+    if not ip:
+        return
     tmp = BIND_CONF + ".api.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -244,14 +268,15 @@ class Handler(BaseHTTPRequestHandler):
             target = (form.get("exit") or [""])[0].strip()
             if not target:
                 return self.jreply({"ok": False, "error": "缺少 exit 参数"}, 400)
-            if not self.rate_ok(name):
-                return
+
             bindings = load_bindings()
             ip = bindings.get(name, {}).get("ip", self.client_ip())
 
             if target in ("-", "入口机"):
+                if not self.rate_ok(name):
+                    return
                 with LOCK:
-                    drop_binding(name)
+                    clear_binding(name)
                     good, err = apply_rules()
                 if not good:
                     return self.jreply({"ok": False, "error": "下发失败: %s" % err}, 500)
@@ -260,6 +285,10 @@ class Handler(BaseHTTPRequestHandler):
             exits = load_exits()
             if target not in exits:
                 return self.jreply({"ok": False, "error": "出口不存在: %s" % target}, 404)
+            if exits[target].get("enable") == "0":
+                return self.jreply({"ok": False, "error": "出口已停用: %s" % target}, 409)
+            if not self.rate_ok(name):
+                return
             with LOCK:
                 write_binding(name, ip, target, exits[target]["mark"])
                 good, err = apply_rules()
@@ -280,8 +309,10 @@ def listen_addr():
                 if m:
                     return m.group(1)
     except FileNotFoundError:
-        pass
-    return "0.0.0.0:18988"
+        # 没有 api.conf 时退回监听全部地址，并在日志里明确提示
+        print("WARN: %s 不存在，API 将监听 0.0.0.0:18988（建议只绑定网桥地址）"
+              % API_CONF, flush=True)
+        return "0.0.0.0:18988"
 
 
 def main():
@@ -289,7 +320,7 @@ def main():
     host, _, port = addr.rpartition(":")
     host = host or "0.0.0.0"
     server = ThreadingHTTPServer((host, int(port)), Handler)
-    print("shlii-egress api listening on %s:%s" % (host, port), flush=True)
+    print("incus-multiroute api listening on %s:%s" % (host, port), flush=True)
     server.serve_forever()
 
 
