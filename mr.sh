@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.1
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1680,22 +1680,22 @@ bind_menu_remove() {
 # ---------------------------------------------------------------- 用户端菜单
 
 pick_container() {
-    # $1=标题 $3=无效时行为(忽略)，成功时把容器名 echo 出去
+    # 界面全部走 stderr，只有选中的容器名走 stdout（否则会被调用方一起捕获）
     local title_txt="$1" f n name
-    clear_if_tty
-    title "$title_txt"
+    clear_if_tty >&2
+    title "$title_txt" >&2
     f="$(mktemp)"
-    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口"
-    subline
-    containers_print_numbered "$f"
-    subline
-    printf ' 输入容器编号（0 返回）: '
+    printf '  %-3s %-22s %-16s %s\n' "编号" "容器" "IPv4" "当前出口" >&2
+    subline >&2
+    containers_print_numbered "$f" >&2
+    subline >&2
+    printf ' 输入容器编号（0 返回）: ' >&2
     read -r n
-    case "$n" in 0|"") rm -f "$f"; info "已取消"; return 1 ;; esac
-    case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; pause_back; return 1 ;; esac
+    case "$n" in 0|"") rm -f "$f"; info "已取消" >&2; return 1 ;; esac
+    case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号" >&2; pause_back >&2; return 1 ;; esac
     name="$(sed -n "${n}p" "$f")"
     rm -f "$f"
-    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    [ -n "$name" ] || { err "无效编号" >&2; pause_back >&2; return 1; }
     printf '%s\n' "$name"
 }
 
