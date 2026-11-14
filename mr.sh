@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.3
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.4
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -781,8 +781,14 @@ install_wireguard() {
 }
 
 install_sslocal() {
-    local arch url tmp bin
-    if sslocal_installed; then ok "sslocal 已安装（$(command -v sslocal)），跳过"; return 0; fi
+    local arch url tmp bin suffix ver
+    if sslocal_installed; then
+        ver="$(sslocal --version 2>&1 | head -1)"
+        case "$ver" in
+            *GLIBC*) warn "已安装的 sslocal 与当前系统 glibc 不兼容，将重新安装"; rm -f /usr/local/bin/sslocal ;;
+            *) ok "sslocal 已安装（$ver），跳过"; return 0 ;;
+        esac
+    fi
     info "尝试从 apt 安装 shadowsocks-rust ..."
     apt-get update -qq >/dev/null 2>&1 || true
     if apt-get install -y shadowsocks-rust >/dev/null 2>&1 && sslocal_installed; then
@@ -790,28 +796,43 @@ install_sslocal() {
         return 0
     fi
     case "$(uname -m)" in
-        x86_64)  arch="x86_64-unknown-linux-gnu" ;;
-        aarch64) arch="aarch64-unknown-linux-gnu" ;;
+        x86_64)  arch="x86_64" ;;
+        aarch64) arch="aarch64" ;;
         *) err "不支持的架构: $(uname -m)"; return 1 ;;
     esac
-    info "改为下载静态二进制（$arch）..."
     has_cmd jq || { err "需要 jq 才能解析 release 列表"; return 1; }
-    url="$(curl -s --max-time 25 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-        | jq -r '.assets[].browser_download_url' 2>/dev/null | grep -m1 "$arch.tar.xz" || true)"
-    [ -n "$url" ] || { err "未取到下载地址（网络受限？）"; return 1; }
     tmp="$(mktemp -d)"
-    if curl -fsSL --max-time 180 -o "$tmp/ss.tar.xz" "$url"; then
-        tar -xJf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1 || tar -xf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1
-        # 官方包是平铺结构（没有子目录），也兼容带子目录的情况
-        bin="$(find "$tmp" -maxdepth 2 -type f -name sslocal 2>/dev/null | head -1)"
-        if [ -n "$bin" ]; then
-            install -m 755 "$bin" /usr/local/bin/sslocal
-            rm -rf "$tmp"
-            sslocal_installed && { ok "sslocal 安装完成（静态二进制，$(sslocal --version 2>/dev/null | head -1)）"; return 0; }
+    # 先 musl（静态，跨发行版通用），再 gnu（动态，可能要求更新的 glibc）
+    for suffix in "unknown-linux-musl.tar.xz" "unknown-linux-gnu.tar.xz"; do
+        url="$(curl -s --max-time 25 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
+            | jq -r '.assets[].browser_download_url' 2>/dev/null | grep -m1 "$arch-$suffix" || true)"
+        [ -n "$url" ] || continue
+        info "下载 $url ..."
+        rm -rf "$tmp"; mkdir -p "$tmp"
+        if ! curl -fsSL --max-time 180 -o "$tmp/ss.tar.xz" "$url"; then
+            warn "下载失败，尝试下一个构建"
+            continue
         fi
-    fi
+        tar -xJf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1 || tar -xf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1
+        bin="$(find "$tmp" -maxdepth 2 -type f -name sslocal 2>/dev/null | head -1)"
+        [ -n "$bin" ] || { warn "包里没有 sslocal，尝试下一个构建"; continue; }
+        install -m 755 "$bin" /usr/local/bin/sslocal
+        ver="$(/usr/local/bin/sslocal --version 2>&1 | head -1)"
+        case "$ver" in
+            *GLIBC*|"")
+                warn "该构建无法运行（$ver），回退下一个构建"
+                rm -f /usr/local/bin/sslocal
+                continue
+                ;;
+            *)
+                rm -rf "$tmp"
+                ok "sslocal 安装完成（$ver）"
+                return 0
+                ;;
+        esac
+    done
     rm -rf "$tmp"
-    err "sslocal 安装失败，请手动放置二进制到 /usr/local/bin/sslocal"
+    err "sslocal 安装失败：请手动放置可运行的二进制到 /usr/local/bin/sslocal"
     return 1
 }
 
