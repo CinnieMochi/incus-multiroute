@@ -563,6 +563,14 @@ apply_all() {
     require_root
     title "下发规则"
     gen_nft
+    if ! nft -c -f "$NFT_FILE" 2>/tmp/mr.nft.err; then
+        err "生成的 nft 规则不合法，已保留现有规则不动"
+        sed -n '1,5p' /tmp/mr.nft.err >&2
+        rm -f /tmp/mr.nft.err
+        pause_back
+        return 1
+    fi
+    rm -f /tmp/mr.nft.err
     nft delete table inet multiroute 2>/dev/null || true
     if nft -f "$NFT_FILE"; then
         ok "nft 规则已加载"
@@ -1244,7 +1252,7 @@ uninstall_all() {
     # 一并清掉历次自更新留下的备份
     rm -f /usr/local/bin/mr.bak.* /usr/local/bin/mr-api.py.bak.* 2>/dev/null || true
     subline
-    ok "卸载完成（wireguard-tools / sing-box / incus 均未改动）"
+    ok "卸载完成（incus、其它面板的 nft 表、所有容器均未改动）"
     printf '\n'
     exit 0
 }
@@ -1297,7 +1305,7 @@ doctor() {
         fi
     fi
     if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
-        check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"，
+        check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"
     else
         printf '  %s[提示]%s %-26s 未开启（可选功能，菜单 9 → 7 开启）\n' "$YELLOW" "$NC" "自动校验定时器"
     fi
@@ -1310,7 +1318,9 @@ doctor() {
         check_item "出口 mark 唯一" 0 "无重复"
     fi
     local conflict
-    conflict="$(ip rule show 2>/dev/null | grep -oE 'fwmark 0x[0-9a-fA-F]+' | awk '{print $2}' | sort -u | grep -viE '^0x1[0-9a-fA-F]{3}$' | head -5 || true)"
+    # 排除本脚本自己的：出口 mark（0x1000-0x1fff）与 tproxy 路由 mark（0x80000001）
+    conflict="$(ip rule show 2>/dev/null | grep -oE 'fwmark 0x[0-9a-fA-F]+' | awk '{print $2}' | sort -u \
+        | grep -viE '^0x1[0-9a-fA-F]{3}$' | grep -viE '^0x80000001$' | head -5 || true)"
     if [ -n "$conflict" ]; then
         printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "外部 fwmark 规则" "$(printf '%s ' $conflict)"
         info "本脚本只用 0x1000-0x1fff；上面若有重叠，先协调再下发，避免抢路由"
@@ -1441,7 +1451,7 @@ exit_add() {
     printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回）: '; read -r host
     case "$host" in 0|"") info "已取消"; return 0 ;; esac
     case "$host" in
-        [*]) host="$(printf '%s' "$host" | tr -d '[]')" ;;
+        \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;;
     esac
     case "$host" in
         *:*)
