@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.4.2
+# Incus MultiRoute 宿主机出口管理脚本 v2.5.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -34,12 +34,14 @@ SS_DIR="$CONF_DIR/singbox"
 CLIENT_BASE="$DATA_DIR/client/out"
 CLIENT_HASH="$CONF_DIR/client.sha256"
 CLIENT_ALLOW_CONF="$CONF_DIR/clients.conf"
+CLIENT_DENY_CONF="$CONF_DIR/clients.deny"
+AUTO_GRANT="${AUTO_GRANT:-0}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.4.2"
+SCRIPT_VERSION="2.5.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -128,6 +130,7 @@ init_main_conf() {
         echo "BRIDGE="$b""
         echo "SUBNET_GW="$gw""
         echo 'TPROXY_BASE="27000"'
+        echo 'AUTO_GRANT=0'
         echo 'WG_PRIVATE_KEY=""'
         echo 'SS_CLIENT_CMD="/usr/local/bin/sing-box run"'
     } > "$MAIN_CONF"
@@ -750,10 +753,43 @@ allowed_count() {
     allowed_list | grep -c . || true
 }
 
+client_denied() {
+    [ -f "$CLIENT_DENY_CONF" ] && grep -qx "$1" "$CLIENT_DENY_CONF"
+}
+
+deny_add()    { [ -f "$CLIENT_DENY_CONF" ] || : > "$CLIENT_DENY_CONF"; grep -qx "$1" "$CLIENT_DENY_CONF" || printf '%s\n' "$1" >> "$CLIENT_DENY_CONF"; }
+deny_remove() { [ -f "$CLIENT_DENY_CONF" ] || return 0; grep -vx "$1" "$CLIENT_DENY_CONF" > "$CLIENT_DENY_CONF.tmp" 2>/dev/null || :; mv -f "$CLIENT_DENY_CONF.tmp" "$CLIENT_DENY_CONF"; }
+
+client_enroll_quiet() {
+    # 静默授权 + 下发：给定时器用，不打印菜单、不 pause
+    local name="$1"
+    client_allowed "$name" || printf '%s\n' "$name" >> "$CLIENT_ALLOW_CONF"
+    bind_get "$name" >/dev/null 2>&1 || bind_clear "$name" >/dev/null 2>&1
+    client_push_one "$name" >/dev/null 2>&1
+}
+
+auto_enroll_new() {
+    # AUTO_GRANT=1 时，把还没授权的新容器自动授权并下发 out
+    [ "${AUTO_GRANT:-0}" = "1" ] || return 0
+    local c n=0
+    # 只处理运行中的容器：停机的推不进去，等它起来下一轮再纳管
+    for c in $(incus list --format=csv -c ns 2>/dev/null | awk -F, '$2=="RUNNING"{print $1}'); do
+        [ -n "$c" ] || continue
+        client_allowed "$c" && continue
+        client_denied "$c" && continue
+        client_enroll_quiet "$c"
+        n=$((n + 1))
+        echo "$(date '+%F %T') 自动授权并下发: $c" >> "$DATA_DIR/sync.log"
+    done
+    [ "$n" -gt 0 ] && info "自动授权了新容器 $n 个"
+    return 0
+}
+
 client_grant() {
     local name="$1"
     [ -n "$name" ] || { err "用法: client_grant 容器名"; return 1; }
     client_allowed "$name" || printf '%s\n' "$name" >> "$CLIENT_ALLOW_CONF"
+    deny_remove "$name"
     ok "$name 已授权使用 out"
     # 关键：API 靠 bindings.conf 的 IP→容器名 识别来源，没有这行就一律 403
     if ! bind_get "$name" >/dev/null 2>&1; then
@@ -773,6 +809,7 @@ client_revoke() {
     fi
     incus exec "$name" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' </dev/null >/dev/null 2>&1 || true
     bind_remove "$name" >/dev/null 2>&1 || true
+    [ "${AUTO_GRANT:-0}" = "1" ] && deny_add "$name"
     ok "$name 已撤销授权，容器内 out 与令牌已移除，绑定已清除"
     pause_back
 }
@@ -875,6 +912,7 @@ client_status() {
 
 client_sync() {
     local quiet="${1:-}" base n h pushed=0 tot=0
+    auto_enroll_new
     base="$(client_hash_base 2>/dev/null || true)"
     [ -n "$base" ] || { [ -n "$quiet" ] || err "缺少基准脚本 $CLIENT_BASE"; return 1; }
     tot="$(allowed_count)"
@@ -954,6 +992,12 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
+    printf ' 是否自动授权并下发「新创建的容器」? [Y/n]: '
+    read -r ag
+    case "$ag" in
+        [nN]) save_main_var AUTO_GRANT 0; AUTO_GRANT=0; info "已关闭自动授权：新容器需要手动 [2] 授权" ;;
+        *)    save_main_var AUTO_GRANT 1; AUTO_GRANT=1; ok "已开启自动授权：定时器每次运行都会把新容器纳管并下发 out" ;;
+    esac
     systemctl daemon-reload
     systemctl enable --now mr-sync.timer >/dev/null 2>&1
     systemctl restart mr-sync.timer >/dev/null 2>&1 || true
@@ -1563,6 +1607,11 @@ doctor() {
             printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "tproxy 策略路由" "缺失，按 10 重新下发"
         fi
     fi
+    if [ "${AUTO_GRANT:-0}" = "1" ]; then
+        check_item "新容器自动授权" 0 "已开启（定时器会把新容器纳管并下发 out）"
+    else
+        printf '  %s[提示]%s %-26s 未开启（新容器需要手动授权，菜单 9 → 10 可开）\n' "$YELLOW" "$NC" "新容器自动授权"
+    fi
     if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
         check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"
     else
@@ -2124,9 +2173,14 @@ client_menu() {
         printf '    %s[7]%s 开启自动校验（自定义间隔，最小 5 分钟）\n' "$GREEN" "$NC"
         printf '    %s[8]%s 关闭自动校验\n' "$GREEN" "$NC"
         printf '    %s[9]%s 更新基准脚本（从指定路径）\n' "$GREEN" "$NC"
+        if [ "${AUTO_GRANT:-0}" = "1" ]; then
+            printf '    %s[10]%s 新容器自动授权：%s已开启%s\n' "$GREEN" "$NC" "$GREEN" "$NC"
+        else
+            printf '    %s[10]%s 新容器自动授权：%s未开启%s\n' "$GREEN" "$NC" "$YELLOW" "$NC"
+        fi
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
-        printf '请输入选项 [0-9]: '
+        printf '请输入选项 [0-10]: '
         read -r c || return 0
         case "$c" in
             1) client_status; pause_back ;;
@@ -2138,10 +2192,24 @@ client_menu() {
             7) sync_timer_on; pause_back ;;
             8) sync_timer_off; pause_back ;;
             9) client_update_base ;;
+            10) auto_grant_toggle; pause_back ;;
             0) return 0 ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
     done
+}
+
+auto_grant_toggle() {
+    if [ "${AUTO_GRANT:-0}" = "1" ]; then
+        save_main_var AUTO_GRANT 0
+        AUTO_GRANT=0
+        ok "已关闭：新容器不再自动授权（已授权的保持不变）"
+    else
+        save_main_var AUTO_GRANT 1
+        AUTO_GRANT=1
+        ok "已开启：定时器每次运行都会把新容器自动授权并下发 out"
+        [ -n "$(sync_timer_state 2>/dev/null)" ] && sync_timer_state | grep -q 已启用 ||             warn "注意：自动校验定时器当前未开启，新容器只会在你手动执行 [6] 或 mr sync 时纳管"
+    fi
 }
 
 client_update_base() {
