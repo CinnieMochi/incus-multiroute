@@ -206,7 +206,8 @@ class Handler(BaseHTTPRequestHandler):
         ip = self.client_ip()
         name = container_by_ip(ip)
         if not name:
-            self.jreply({"ok": False, "error": "未识别的容器来源: %s" % ip}, 403)
+            self.jreply({"ok": False,
+                         "error": "未识别的容器来源 %s：该容器还没有身份记录，请管理员在菜单 [6] 绑定，或 [9] 重新授权" % ip}, 403)
             return None
         if name not in load_allow():
             self.jreply({"ok": False, "error": "该容器未获授权使用 out"}, 403)

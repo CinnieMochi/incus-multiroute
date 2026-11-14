@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.3.6
+# Incus MultiRoute 宿主机出口管理脚本 v1.3.7
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -587,6 +587,11 @@ client_grant() {
     [ -n "$name" ] || { err "用法: client_grant 容器名"; return 1; }
     client_allowed "$name" || printf '%s\n' "$name" >> "$CLIENT_ALLOW_CONF"
     ok "$name 已授权使用 out"
+    # 关键：API 靠 bindings.conf 的 IP→容器名 识别来源，没有这行就一律 403
+    if ! bind_get "$name" >/dev/null 2>&1; then
+        bind_clear "$name" >/dev/null 2>&1
+        info "已为 $name 建立身份记录（当前：入口机直出），它现在可以自己切换出口"
+    fi
     client_push_one "$name"
     pause_back
 }
@@ -622,6 +627,7 @@ client_grant_all() {
     esac
     for c in $names; do
         client_allowed "$c" || printf '%s\n' "$c" >> "$CLIENT_ALLOW_CONF"
+        bind_get "$c" >/dev/null 2>&1 || bind_clear "$c" >/dev/null 2>&1
         client_push_one "$c" >/dev/null 2>&1 && cnt=$((cnt + 1))
     done
     subline
