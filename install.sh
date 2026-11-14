@@ -38,9 +38,12 @@ info "下载最新源码 ..."
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# 优先 codeload（不受 raw CDN 缓存影响），失败再退回 raw
-if curl -fsSL --max-time 120 -o "$TMP/src.tar.gz" \
-     "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" 2>/dev/null; then
+# 优先用 commit SHA 拉 codeload（分支名 tarball 也会被 CDN 缓存）
+SHA="$(curl -s --max-time 20 "https://api.github.com/repos/$REPO/git/refs/heads/$BRANCH" 2>/dev/null \
+      | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+SRC_URL="https://codeload.github.com/$REPO/tar.gz/$SHA"
+[ -n "$SHA" ] || SRC_URL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH"
+if curl -fsSL --max-time 120 -o "$TMP/src.tar.gz" "$SRC_URL" 2>/dev/null; then
     mkdir -p "$TMP/src"
     tar -xzf "$TMP/src.tar.gz" -C "$TMP/src" 2>/dev/null
     SRC_DIR="$(find "$TMP/src" -maxdepth 1 -type d -name '*multiroute*' | head -1)"

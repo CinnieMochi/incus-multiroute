@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.6
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.7
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.6"
+SCRIPT_VERSION="1.2.7"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -979,8 +979,10 @@ update_menu() {
     info "正在检查远端版本 ..."
     chk="$(mktemp -d)"
     # codeload 不受 raw CDN 缓存影响，优先用它取版本号
-    if curl -fsSL --max-time 90 -o "$chk/src.tar.gz" \
-        "https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH" 2>/dev/null; then
+    sha="$(curl -s --max-time 20 "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/git/refs/heads/$REPO_BRANCH" 2>/dev/null | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+    src_url="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$sha"
+    [ -n "$sha" ] || src_url="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH"
+    if curl -fsSL --max-time 90 -o "$chk/src.tar.gz" "$src_url" 2>/dev/null; then
         mkdir -p "$chk/src"
         tar -xzf "$chk/src.tar.gz" -C "$chk/src" 2>/dev/null
         rv="$(cat "$(find "$chk/src" -maxdepth 2 -name version.txt | head -1)" 2>/dev/null | tr -d '\r\n ')"
@@ -1011,8 +1013,10 @@ update_menu() {
     case "$a" in [yY]) ;; *) info "已取消，未做任何改动"; pause_back; return 0 ;; esac
     tmp="$(mktemp -d)"
     info "下载新版本 ..."
-    if curl -fsSL --max-time 120 -o "$tmp/src.tar.gz" \
-        "https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH" 2>/dev/null; then
+    sha="$(curl -s --max-time 20 "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/git/refs/heads/$REPO_BRANCH" 2>/dev/null | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+    src_url2="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$sha"
+    [ -n "$sha" ] || src_url2="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH"
+    if curl -fsSL --max-time 120 -o "$tmp/src.tar.gz" "$src_url2" 2>/dev/null; then
         mkdir -p "$tmp/src"
         tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" 2>/dev/null
         local sd2
