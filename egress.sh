@@ -517,6 +517,61 @@ client_revoke() {
     pause_back
 }
 
+client_grant_all() {
+    local names n c cnt=0 preview
+    names="$(containers_scan 2>/dev/null | cut -f1)"
+    n="$(printf '%s\n' "$names" | grep -c . || true)"
+    title "全部授权并下发"
+    [ "$n" -gt 0 ] || { warn "没有可用容器"; pause_back; return 1; }
+    preview="$(printf '%s\n' "$names" | head -6 | tr '\n' ' ')"
+    warn "将给全部 $n 个容器授权使用 out，并逐个推送脚本与令牌"
+    info "容器: $preview$([ "$n" -gt 6 ] && echo '...')"
+    subline
+    printf ' 输入 yes 继续，其它任意键取消: '
+    read -r a
+    case "$a" in
+        [yY][eE][sS]) ;;
+        *) info "已取消，未做任何改动"; pause_back; return 0 ;;
+    esac
+    for c in $names; do
+        client_allowed "$c" || printf '%s\n' "$c" >> "$CLIENT_ALLOW_CONF"
+        client_push_one "$c" >/dev/null 2>&1 && cnt=$((cnt + 1))
+    done
+    subline
+    ok "已授权并下发 $cnt / $n 个容器"
+    pause_back
+}
+
+client_revoke_all() {
+    local list n c cnt=0
+    list="$(allowed_list)"
+    n="$(printf '%s\n' "$list" | grep -c . || true)"
+    title "全部撤销授权并回收"
+    if [ "$n" = "0" ]; then
+        info "当前没有任何已授权用户，无需回收"
+        pause_back
+        return 0
+    fi
+    warn "将撤销全部 $n 个用户的授权，并从这些容器内删除 out 与令牌"
+    info "名单: $(printf '%s ' $list)"
+    subline
+    printf ' 输入 yes 继续，其它任意键取消: '
+    read -r a
+    case "$a" in
+        [yY][eE][sS]) ;;
+        *) info "已取消，未做任何改动"; pause_back; return 0 ;;
+    esac
+    for c in $list; do
+        incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' >/dev/null 2>&1 && cnt=$((cnt + 1))
+        bind_remove "$c" >/dev/null 2>&1 || true
+    done
+    printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
+    apply_all >/dev/null 2>&1 || true
+    subline
+    ok "已回收 $cnt / $n 个容器，白名单已清空"
+    pause_back
+}
+
 client_push_one() {
     local name="$1" tok tmp
     [ -f "$CLIENT_BASE" ] || { err "缺少基准脚本 $CLIENT_BASE（先在菜单 15 安装本脚本）"; return 1; }
@@ -1248,22 +1303,26 @@ client_menu() {
         printf '    %s[1]%s 查看授权与同步状态\n' "$GREEN" "$NC"
         printf '    %s[2]%s 授权并下发（单个用户）\n' "$GREEN" "$NC"
         printf '    %s[3]%s 撤销授权并回收（单个用户）\n' "$GREEN" "$NC"
-        printf '    %s[4]%s 校验并修复（仅已授权用户）\n' "$GREEN" "$NC"
-        printf '    %s[5]%s 开启自动校验（每 10 分钟）\n' "$GREEN" "$NC"
-        printf '    %s[6]%s 关闭自动校验\n' "$GREEN" "$NC"
-        printf '    %s[7]%s 更新基准脚本（从指定路径）\n' "$GREEN" "$NC"
+        printf '    %s[4]%s 全部授权并下发（所有容器）\n' "$GREEN" "$NC"
+        printf '    %s[5]%s 全部撤销授权并回收\n' "$GREEN" "$NC"
+        printf '    %s[6]%s 校验并修复（仅已授权用户）\n' "$GREEN" "$NC"
+        printf '    %s[7]%s 开启自动校验（每 10 分钟）\n' "$GREEN" "$NC"
+        printf '    %s[8]%s 关闭自动校验\n' "$GREEN" "$NC"
+        printf '    %s[9]%s 更新基准脚本（从指定路径）\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回上一层\n' "$GREEN" "$NC"
         line
-        printf '请输入选项 [0-7]: '
+        printf '请输入选项 [0-9]: '
         read -r c
         case "$c" in
             1) client_status; pause_back ;;
             2) printf '容器名: '; read -r cn; client_grant "$cn" ;;
             3) printf '容器名: '; read -r cn; client_revoke "$cn" ;;
-            4) client_sync ;;
-            5) sync_timer_on; pause_back ;;
-            6) sync_timer_off; pause_back ;;
-            7) client_update_base ;;
+            4) client_grant_all ;;
+            5) client_revoke_all ;;
+            6) client_sync ;;
+            7) sync_timer_on; pause_back ;;
+            8) sync_timer_off; pause_back ;;
+            9) client_update_base ;;
             0) return 0 ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
