@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.5
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.6
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.4.6"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1004,7 +1004,7 @@ deps_menu() {
         printf '  %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-4]: '
-        read -r c
+        read -r c || return 0
         case "$c" in
             1) install_base; pause_back ;;
             2) install_wireguard; pause_back ;;
@@ -1305,7 +1305,7 @@ api_menu() {
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-4]: '
-        read -r c
+        read -r c || return 0
         case "$c" in
             1) api_install_unit; pause_back ;;
             2) api_install_unit; systemctl restart mr-api; sleep 1
@@ -1496,7 +1496,7 @@ exit_del() {
     printf '  输入 99  ：删除全部出口\n'
     printf '  输入 0   ：返回\n'
     printf '请输入: '
-    read -r n
+    read -r n || return 0
     case "$n" in
         0|"") rm -f "$f"; return 0 ;;
         99)
@@ -1545,7 +1545,7 @@ exits_list() {
         printf '  输入编号：切换该出口 启用/停用（停用后用户端不再显示）\n'
         printf '  输入 0   ：返回\n'
         printf '请输入: '
-        read -r n
+        read -r n || return 0
         case "$n" in
             0|"") rm -f "$f"; return 0 ;;
         esac
@@ -1608,7 +1608,7 @@ exit_test_menu() {
     subline
     printf '  输入编号：测试该出口    输入 all：测试全部    输入 0：返回\n'
     printf '请输入: '
-    read -r n
+    read -r n || return 0
     case "$n" in
         0|"") rm -f "$f"; return 0 ;;
         all|ALL)
@@ -1715,7 +1715,7 @@ pick_container() {
     containers_print_numbered "$f" >&2
     subline >&2
     printf ' 输入容器编号（0 返回）: ' >&2
-    read -r n
+    read -r n || return 0
     case "$n" in 0|"") rm -f "$f"; info "已取消" >&2; return 1 ;; esac
     case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号" >&2; pause_back >&2; return 1 ;; esac
     name="$(sed -n "${n}p" "$f")"
@@ -1746,7 +1746,7 @@ client_menu() {
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-9]: '
-        read -r c
+        read -r c || return 0
         case "$c" in
             1) client_status; pause_back ;;
             2) CN="$(pick_container "授权并下发" 1)" && [ -n "$CN" ] && client_grant "$CN" ;;
@@ -1834,7 +1834,7 @@ menu_main() {
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
         line
         printf '请输入选项 [0-15 / 99]: '
-        read -r choice
+        read -r choice || exit 0
         case "$choice" in
             1) exits_list ;;
             2) exit_add ;;
