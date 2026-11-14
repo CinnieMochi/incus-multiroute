@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.5
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.6
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.6"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -346,7 +346,7 @@ emit_redirect() {
         ss|ss2022)
             local port
             port="$(exit_ss_port "$name")"
-            echo "        meta mark $mark tcp redirect to :$port"
+            echo "        meta mark $mark meta l4proto tcp redirect to :$port"
             echo "        meta mark $mark udp dport != 53 counter drop"
             ;;
     esac
@@ -426,7 +426,8 @@ apply_ss_units() {
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable <<< "$l"
         case "$proto" in ss|ss2022) ;; *) continue ;; esac
-        local u="mr-ss-$name.service"
+        # systemd 单元名必须是 ASCII，中文名称会被 escape 导致 systemctl 失效，这里用 mark 命名
+        local u="mr-ss-$mark.service"
         if [ "$enable" = "0" ]; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
             continue
@@ -471,7 +472,7 @@ EOF
         [ -e "$f" ] || continue
         n="$(basename "$f" .service)"
         n="${n#mr-ss-}"
-        if ! exit_exists "$n"; then
+        if ! grep -q "|$n|" "$EXITS_CONF" 2>/dev/null; then
             systemctl disable --now "mr-ss-$n.service" >/dev/null 2>&1 || true
             rm -f "$f"
             info "已清理失效单元: mr-ss-$n.service"
@@ -1330,7 +1331,7 @@ exit_test_one() {
             ;;
         ss|ss2022)
             local u port
-            u="mr-ss-$name.service"
+            u="mr-ss-$(exit_fld "$l" 7).service"
             port="$(exit_ss_port "$name")"
             if systemctl is-active --quiet "$u" 2>/dev/null && ss -ltn 2>/dev/null | grep -q ":$port "; then
                 printf '  %-14s %s本地 %s 就绪（端到端请在容器内实测）%s\n' "$name" "$GREEN" "$port" "$NC"
