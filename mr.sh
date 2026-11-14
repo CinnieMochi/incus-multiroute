@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.0
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -404,6 +404,21 @@ ensure_wg_key() {
     printf ' %s宿主机公钥%s（填进出口机 wg 配置的 [Peer] PublicKey）:\n  %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$pub" "$NC"
 }
 
+json_esc() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+mark_next() {
+    # 从 0x1001 起找第一个未被占用的 mark
+    local i=1 m
+    while [ "$i" -le 4000 ]; do
+        m="$(printf '0x%x' $((0x1000 + i)))"
+        grep -q "|$m|" "$EXITS_CONF" 2>/dev/null || { echo "$m"; return 0; }
+        i=$((i + 1))
+    done
+    echo "0x1fff"
+}
+
 apply_ss_units() {
     local name proto host port method pass enable l cmd
     while IFS= read -r l; do
@@ -419,10 +434,10 @@ apply_ss_units() {
         lport="$(exit_ss_port "$name")"
         cat > "$SS_DIR/$name.json" <<EOF
 {
-  "server": "$host",
+  "server": "$(json_esc "$host")",
   "server_port": $port,
-  "password": "$pass",
-  "method": "$method",
+  "password": "$(json_esc "$pass")",
+  "method": "$(json_esc "$method")",
   "local_address": "127.0.0.1",
   "local_port": $lport,
   "mode": "tcp_only"
@@ -1076,6 +1091,14 @@ doctor() {
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
     systemctl is-active --quiet mr-sync.timer 2>/dev/null; check_item "自动校验定时器" "$?" "菜单 11 可开启"
+    local dup
+    dup="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' 'NF>=7 && $7!="" {print $7}' | sort | uniq -d | tr '\n' ' ')"
+    if [ -n "$dup" ]; then
+        printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "出口 mark 重复" "$dup"
+        info "重复 mark 会让两个出口抢同一张路由表，请在 [3] 删除后重新 [2] 添加"
+    else
+        check_item "出口 mark 唯一" 0 "无重复"
+    fi
     local conflict
     conflict="$(ip rule show 2>/dev/null | grep -oE 'fwmark 0x[0-9a-fA-F]+' | awk '{print $2}' | sort -u | grep -viE '^0x1[0-9a-fA-F]{3}$' | head -5 || true)"
     if [ -n "$conflict" ]; then
@@ -1193,7 +1216,7 @@ exit_add() {
     fi
     printf '期望出口 IP（留空则用服务器地址）: '; read -r expect
     [ -n "$expect" ] || expect="$host"
-    mark="$(printf '0x%x' $((0x1000 + $(exits_count) + 1)))"
+    mark="$(mark_next)"
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
     ok "已新增出口 $name（mark $mark）"
     pause_back

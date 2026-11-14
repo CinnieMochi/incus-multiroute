@@ -27,6 +27,7 @@ EGRESS_BIN = "/usr/local/bin/mr"
 
 LOCK = threading.Lock()
 RATE = {}
+RATE_LOCK = threading.Lock()
 RATE_MIN_INTERVAL = 2.0   # 同一容器两次切换的最小间隔，防止刷接口导致 nft 反复重载
 
 
@@ -217,14 +218,19 @@ class Handler(BaseHTTPRequestHandler):
         return name
 
     def rate_ok(self, name):
-        now = time.time()
-        last = RATE.get(name, 0)
-        if now - last < RATE_MIN_INTERVAL:
-            wait = round(RATE_MIN_INTERVAL - (now - last), 1)
+        # 检查与写入必须原子，否则并发请求会同时通过，导致规则被重复下发
+        with RATE_LOCK:
+            now = time.time()
+            last = RATE.get(name, 0)
+            if now - last < RATE_MIN_INTERVAL:
+                wait = round(RATE_MIN_INTERVAL - (now - last), 1)
+                ok = False
+            else:
+                RATE[name] = now
+                ok = True
+        if not ok:
             self.jreply({"ok": False, "error": "操作太频繁，请 %.1f 秒后再试" % wait}, 429)
-            return False
-        RATE[name] = now
-        return True
+        return ok
 
     def current_of(self, name):
         b = load_bindings().get(name)
