@@ -647,7 +647,7 @@ comp_line() {
     if wg_installed; then wg_badge="${GREEN}已安装${NC}"; else wg_badge="${RED}未安装${NC}"; fi
     if sslocal_installed; then ss_badge="${GREEN}已安装${NC}"; else ss_badge="${RED}未安装${NC}"; fi
     ss_n="$(ss_active_units)"
-    printf '  组件  wireguard-tools %b   sslocal %b（运行中 %s 个）\n' "$wg_badge" "$ss_badge" "$ss_n"
+    printf '  %swireguard-tools%s %b   %ssslocal%s %b（运行中 %s 个出口）\n' "$BLUE" "$NC" "$wg_badge" "$BLUE" "$NC" "$ss_badge" "$ss_n"
 }
 
 install_wireguard() {
@@ -1291,7 +1291,7 @@ client_update_base() {
 
 banner_status() {
     local incus_ver bridge_gw c_count b_count exits_n
-    incus_ver="$(incus version 2>/dev/null | head -1 | awk '{print $2}' || true)"
+    incus_ver="$(incus version 2>/dev/null | head -1 | awk '{print $3}' || true)"
     [ -n "$incus_ver" ] || incus_ver="未安装"
     bridge_gw="$(detect_gateway)"
     exits_n="$(exits_count)"
@@ -1300,10 +1300,14 @@ banner_status() {
     line
     printf '        %sIncuShlii Egress 出口管理 v%s%s\n' "$CYAN" "$SCRIPT_VERSION" "$NC"
     line
-    printf '  %s系统%s  %s   %sincus%s  %s\n' "$BLUE" "$NC" "$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)" "$BLUE" "$NC" "$incus_ver"
-    printf '  %s网桥%s  %s    %s网关%s  %s\n' "$BLUE" "$NC" "$BRIDGE" "$BLUE" "$NC" "$bridge_gw"
-    printf '  %s出口%s  %s 个     %s容器%s  %s 个（已绑定 %s）\n' "$BLUE" "$NC" "$exits_n" "$BLUE" "$NC" "$c_count" "$b_count"
-    printf '  %s用户端%s 基准%s   自动校验 %s\n' "$BLUE" "$NC" "$([ -f "$CLIENT_BASE" ] && echo 已就绪 || echo 未安装)" "$(sync_timer_state)"
+    local os_name
+    os_name="$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+    [ -n "$os_name" ] || os_name="未知系统"
+    printf '  %s系统%s    %s\n' "$BLUE" "$NC" "$os_name"
+    printf '  %s版本%s    incus %s\n' "$BLUE" "$NC" "$incus_ver"
+    printf '  %s网桥%s    %s（%s）\n' "$BLUE" "$NC" "$BRIDGE" "$bridge_gw"
+    printf '  %s出口%s    %s 个      %s容器%s  %s 个，已绑定 %s\n' "$BLUE" "$NC" "$exits_n" "$BLUE" "$NC" "$c_count" "$b_count"
+    printf '  %s用户%s    基准 %s，自动校验 %s\n' "$BLUE" "$NC" "$([ -f "$CLIENT_BASE" ] && echo 已就绪 || echo 未安装)" "$(sync_timer_state)"
     comp_line
     subline
 }
