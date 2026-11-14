@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.4
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.5
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1001,7 +1001,7 @@ deps_menu() {
         printf '  %s[4]%s 全部安装（1 + 2 + 3）\n' "$GREEN" "$NC"
         printf '  %s[5]%s 检查组件更新（已装的才会检查）\n' "$GREEN" "$NC"
         printf '  ------------------------------------------------------------\n'
-        printf '  %s[0]%s 返回上一层\n' "$GREEN" "$NC"
+        printf '  %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-4]: '
         read -r c
@@ -1302,7 +1302,7 @@ api_menu() {
         printf '    %s[2]%s 启动 / 重启\n' "$GREEN" "$NC"
         printf '    %s[3]%s 停止\n' "$GREEN" "$NC"
         printf '    %s[4]%s 查看日志\n' "$GREEN" "$NC"
-        printf '    %s[0]%s 返回上一层\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-4]: '
         read -r c
@@ -1333,7 +1333,7 @@ exit_add() {
     printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
     printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
     printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
-    printf '  %s[0]%s 返回上一级\n' "$GREEN" "$NC"
+    printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
     printf '请输入 [0-3]: '
     read -r proto_sel
     case "$proto_sel" in
@@ -1397,7 +1397,7 @@ exit_add() {
             printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"
             i=$((i + 1))
         done
-        printf '  %s[0]%s 返回上一级\n' "$GREEN" "$NC"
+        printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
         printf '请输入 [0-%s]: ' "$((i - 1))"
         read -r msel
         case "$msel" in 0|"") info "已取消"; return 0 ;; esac
@@ -1743,7 +1743,7 @@ client_menu() {
         printf '    %s[7]%s 开启自动校验（自定义间隔，最小 5 分钟）\n' "$GREEN" "$NC"
         printf '    %s[8]%s 关闭自动校验\n' "$GREEN" "$NC"
         printf '    %s[9]%s 更新基准脚本（从指定路径）\n' "$GREEN" "$NC"
-        printf '    %s[0]%s 返回上一层\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-9]: '
         read -r c
