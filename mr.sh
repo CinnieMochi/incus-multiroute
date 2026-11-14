@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.0.1
+# Incus MultiRoute 宿主机出口管理脚本 v2.0.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -353,7 +353,10 @@ emit_tproxy() {
         ss|ss2022)
             local port
             port="$(exit_ss_port "$name")"
-            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } tproxy ip to :$port meta mark set 0x80000001"
+            # ct direction original：只劫持"容器主动发起"的包。
+            # 不加这一条，容器作为服务端时（如 vless / hy2），它给客户端回包也会被劫持，
+            # 导致外部连接超时。实测踩过。
+            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip to :$port meta mark set 0x80000001"
             ;;
     esac
 }
@@ -558,27 +561,37 @@ EOF
     fi
 }
 
-apply_all() {
+apply_nft_only() {
+    # 只重建 nft 表：绑定关系变化时用这个，不重启 sing-box，
+    # 避免"一个人切换出口，所有人的连接都被打断"
     load_conf
     require_root
-    title "下发规则"
     gen_nft
     if ! nft -c -f "$NFT_FILE" 2>/tmp/mr.nft.err; then
         err "生成的 nft 规则不合法，已保留现有规则不动"
         sed -n '1,5p' /tmp/mr.nft.err >&2
         rm -f /tmp/mr.nft.err
-        pause_back
         return 1
     fi
     rm -f /tmp/mr.nft.err
     nft delete table inet multiroute 2>/dev/null || true
-    if nft -f "$NFT_FILE"; then
-        ok "nft 规则已加载"
+    nft -f "$NFT_FILE" || return 1
+    if [ "$(ss_enabled_count)" -gt 0 ]; then
+        ensure_tproxy_sysctl
+        tproxy_routing_on
     else
-        err "nft 规则加载失败，见 $NFT_FILE"
-        pause_back
-        return 1
+        tproxy_routing_off
+        [ -f /etc/sysctl.d/90-incus-multiroute.conf ] && remove_tproxy_sysctl
     fi
+    return 0
+}
+
+apply_all() {
+    load_conf
+    require_root
+    title "下发规则"
+    apply_nft_only || { err "nft 下发失败"; pause_back; return 1; }
+    ok "nft 规则已加载"
     gen_wg
     apply_ss_units
     # 只做最小必要改动：ip_forward 本就是 incus 要求开启的；
@@ -587,15 +600,7 @@ apply_all() {
     if [ "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = "1" ]; then
         sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 && info "rp_filter: 1 -> 2（策略路由必需，仅在严格模式时调整）"
     fi
-    if [ "$(ss_enabled_count)" -gt 0 ]; then
-        ensure_tproxy_sysctl
-        tproxy_routing_on
-        ok "透明代理已就绪（TCP+UDP tproxy）"
-    else
-        tproxy_routing_off
-        # 没有 ss 出口时不需要 tproxy，把 br_netfilter 还原，避免影响容器间过滤
-        [ -f /etc/sysctl.d/90-incus-multiroute.conf ] && remove_tproxy_sysctl
-    fi
+    [ "$(ss_enabled_count)" -gt 0 ] && ok "透明代理已就绪（TCP+UDP tproxy）"
     ensure_boot_unit
     ok "全部下发完成"
 }
@@ -1979,7 +1984,8 @@ Incus MultiRoute 宿主机出口管理
 
 用法:
   mr                    进入交互菜单
-  mr apply              重新下发全部规则
+  mr apply              重新下发全部规则（含重启 sing-box）
+  mr apply-nft          只重建 nft 规则（绑定变化时用，不打断现有连接）
   mr refresh            按 incus 实际状态校正容器 IP 后下发
   mr sync               校验并下发用户端 out（供定时器调用）
   mr doctor             环境体检
@@ -2001,6 +2007,8 @@ case "${1:-menu}" in
         main; menu_main ;;
     apply)
         main; apply_all ;;
+    apply-nft)
+        main; apply_nft_only; exit $? ;;
     refresh)
         main; bindings_refresh; apply_all ;;
     sync)

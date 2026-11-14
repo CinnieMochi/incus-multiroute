@@ -187,7 +187,9 @@ def drop_binding(name):
 
 def apply_rules():
     try:
-        r = subprocess.run([EGRESS_BIN, "apply"], capture_output=True, timeout=90)
+        # 用 apply-nft：只重建 nft，不重启 sing-box。
+        # 绑定切换不该打断其它人（以及自己）已经建立的连接。
+        r = subprocess.run([EGRESS_BIN, "apply-nft"], capture_output=True, timeout=90)
         return r.returncode == 0, (r.stderr or b"").decode("utf-8", "ignore")[-400:]
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)

@@ -27,7 +27,7 @@ mr
 | 支持协议 | **Shadowsocks**、**Shadowsocks 2022**（TCP + UDP 全代理）、**WireGuard**（全协议） |
 | 操作方式 | 全交互式菜单，不需要记命令 |
 | 隔离性 | 只维护自己的一张 nft 表，不碰 incus 与其它面板的规则 |
-| 当前版本 | **v2.0.1** |
+| 当前版本 | **v2.0.2** |
 
 ---
 
@@ -709,6 +709,14 @@ nslookup -type=TXT o-o.myaddr.l.google.com ns1.google.com
 **可以给不同用户分配同一个出口吗？**
 可以，多条绑定指向同一个出口即可。
 
+**切换出口会断开现有连接吗？**
+不会。用户在容器里执行 out use 切换出口时，宿主机只重建 nft 规则（mr apply-nft），**不会重启 sing-box**，所以：
+
+- 切换者自己已经建立的连接不受影响
+- 其它用容器建立的连接也不受影响
+
+只有"新增/删除/停用出口"或手动按 10 时才会重启 sing-box，那一刻所有经过该出口的连接会短暂断开。
+
 **出口机挂了会怎样？**
 绑定的容器会连不上外网，而**不会**回落到直出。这是刻意的：避免用户以为自己在用出口、实际泄露了入口机 IP。临时维护请用菜单 1 停用出口。
 
@@ -768,7 +776,8 @@ nslookup -type=TXT o-o.myaddr.l.google.com ns1.google.com
 
 ```bash
 mr              # 打开菜单
-mr apply        # 重新下发全部规则
+mr apply        # 重新下发全部规则（含重启 sing-box，会断开现有连接）
+mr apply-nft    # 只重建 nft（绑定变化时用，不打断现有连接）
 mr refresh      # 按 incus 实际状态校正容器 IP
 mr sync         # 校验并下发用户端 out
 mr doctor       # 环境体检
@@ -780,6 +789,7 @@ mr doctor       # 环境体检
 
 | 版本 | 主要变化 |
 |---|---|
+| v2.0.2 | 切换出口不再重启 sing-box（新增 mr apply-nft），切节点不再打断自己和别人的连接；tproxy 只劫持容器主动发起的连接，容器自建服务端回包不再被误劫持 |
 | v2.0.1 | 支持 IPv6 落地机（WG 端点自动加方括号）；新增 IPv6 旁路提示；TPROXY_BASE 兜底；无 ss 出口时自动恢复 br_netfilter；nft 下发前先校验；体检修掉自身 mark 误报 |
 | v2.0.0 | ss/ss2022 改用 sing-box TPROXY，**TCP 与 UDP 全部代理**；自动关闭 br_netfilter；体检新增 br_netfilter 与 tproxy 策略路由检查；卸载自动恢复 sysctl |
 | v1.4.6 | 修复菜单在输入流结束时无限刷屏 |
