@@ -530,6 +530,7 @@ ss / ss2022 出口使用 **sing-box 的 TPROXY 模式**，容器里不需要任�
 
 ### 反悔方法
 
+    停用所有 ss 出口 → 脚本会自动把 br_netfilter 恢复成 1
     菜单 99 一键卸载 → 会自动把 br_netfilter 恢复成 1
     或者手动：sysctl -w net.bridge.bridge-nf-call-iptables=1
               rm -f /etc/sysctl.d/90-incus-multiroute.conf

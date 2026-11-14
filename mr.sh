@@ -50,6 +50,7 @@ SUBNET_GW=""
 TPROXY_BASE="41000"
 WG_PRIVATE_KEY=""
 SINGBOX_BIN="/usr/local/bin/sing-box"
+TPROXY_BASE="${TPROXY_BASE:-41000}"
 SS_CLIENT_CMD="$SINGBOX_BIN run"
 
 # ---------------------------------------------------------------- 输出
@@ -581,6 +582,8 @@ apply_all() {
         ok "透明代理已就绪（TCP+UDP tproxy）"
     else
         tproxy_routing_off
+        # 没有 ss 出口时不需要 tproxy，把 br_netfilter 还原，避免影响容器间过滤
+        [ -f /etc/sysctl.d/90-incus-multiroute.conf ] && remove_tproxy_sysctl
     fi
     ensure_boot_unit
     ok "全部下发完成"
