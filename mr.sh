@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.5.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.5.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -41,7 +41,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -832,6 +832,7 @@ client_grant_all() {
     esac
     for c in $names; do
         client_allowed "$c" || printf '%s\n' "$c" >> "$CLIENT_ALLOW_CONF"
+        deny_remove "$c"
         bind_get "$c" >/dev/null 2>&1 || bind_clear "$c" >/dev/null 2>&1
         client_push_one "$c" >/dev/null 2>&1 && cnt=$((cnt + 1))
     done
@@ -862,6 +863,8 @@ client_revoke_all() {
     for c in $list; do
         incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' </dev/null >/dev/null 2>&1 && cnt=$((cnt + 1))
         bind_remove "$c" >/dev/null 2>&1 || true
+        # 开启自动授权时，被撤销的必须进黑名单，否则下一轮又被自动加回来
+        [ "${AUTO_GRANT:-0}" = "1" ] && deny_add "$c"
     done
     printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
     apply_nft_only >/dev/null 2>&1 || true
