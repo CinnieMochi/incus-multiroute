@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.3.1
+# Incus MultiRoute 宿主机出口管理脚本 v2.4.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -110,7 +110,7 @@ detect_subnet() {
 
 ensure_dirs() {
     mkdir -p "$CONF_DIR" "$DATA_DIR" "$DATA_DIR/client" "$SS_DIR"
-    [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用' > "$EXITS_CONF"
+    [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
     [ -f "$BIND_CONF" ]  || printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
     [ -f "$TOKEN_CONF" ] || { : > "$TOKEN_CONF"; chmod 600 "$TOKEN_CONF"; }
     [ -f "$CONF_DIR/api.conf" ] || printf 'LISTEN="0.0.0.0:18988"\n' > "$CONF_DIR/api.conf"
@@ -167,8 +167,8 @@ exits_each() {
     local cb="$1" l
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r e_name e_proto e_host e_port e_method e_pass e_mark e_wgkey e_wgif e_local e_expect e_enable <<< "$l"
-        "$cb" "$e_name" "$e_proto" "$e_host" "$e_port" "$e_method" "$e_pass" "$e_mark" "$e_wgkey" "$e_wgif" "$e_local" "$e_expect" "$e_enable"
+        IFS="|" read -r e_name e_proto e_host e_port e_method e_pass e_mark e_wgkey e_wgif e_local e_expect e_enable e_lp <<< "$l"
+        "$cb" "$e_name" "$e_proto" "$e_host" "$e_port" "$e_method" "$e_pass" "$e_mark" "$e_wgkey" "$e_wgif" "$e_local" "$e_expect" "$e_enable" "$e_lp"
     done < "$EXITS_CONF"
 }
 
@@ -197,11 +197,20 @@ exit_ss_port() {
     local want="$1" l i=0 name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable <<< "$l"
+        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
         case "$proto" in ss|ss2022) ;; *) continue ;; esac
         i=$((i + 1))
         if [ "$name" = "$want" ]; then
-            echo $((TPROXY_BASE + i))
+            # 第 13 字段是"指定端口"：被占用时给这个出口单独分配的号，优先使用
+            if [ -n "${a10:-}" ]; then
+                echo "$a10"
+                return 0
+            fi
+            i_port=$((TPROXY_BASE + i))
+            if [ "$i_port" -gt "$((TPROXY_BASE + 99))" ]; then
+                return 1
+            fi
+            echo "$i_port"
             return 0
         fi
     done < "$EXITS_CONF"
@@ -490,7 +499,7 @@ ss_enabled_count() {
     local n=0 l name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable <<< "$l"
+        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
         case "$proto" in
             ss|ss2022) [ "${enable:-1}" != "0" ] && n=$((n + 1)) ;;
         esac
@@ -530,7 +539,7 @@ apply_ss_units() {
     local name proto host port method pass enable l cmd
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable <<< "$l"
+        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp <<< "$l"
         case "$proto" in ss|ss2022) ;; *) continue ;; esac
         local u="mr-ss-$mark.service"
         if [ "$enable" = "0" ]; then
@@ -538,9 +547,8 @@ apply_ss_units() {
             continue
         fi
         local lport
-        lport="$(exit_ss_port "$name")"
-        if [ "$lport" -gt "$((TPROXY_BASE + 99))" ]; then
-            warn "$name: 端口 $lport 超出 $TPROXY_BASE-$((TPROXY_BASE + 99)) 范围，该出口不可用"
+        if ! lport="$(exit_ss_port "$name")" || [ -z "$lport" ]; then
+            warn "$name: 没有可用端口（端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 已用尽）"
             continue
         fi
         local owner
@@ -1288,7 +1296,7 @@ uninstall_all() {
     # 单元是按 mark 命名的（中文名不能做 systemd 单元名），这里必须用 mark
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
         case "$proto" in
             ss|ss2022) systemctl disable --now "mr-ss-$mark.service" >/dev/null 2>&1 || true ;;
         esac
@@ -1299,7 +1307,7 @@ uninstall_all() {
     info "清理 wg 接口与策略路由 ..."
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
         [ "$proto" = "wg" ] || continue
         table="$(wg_table "$name")"
         ip rule del fwmark "$mark" table "$table" 2>/dev/null || true
@@ -1732,36 +1740,39 @@ exit_add() {
     case "$expect" in 0) info "已取消"; return 0 ;; esac
     [ -n "$expect" ] || expect="$host"
     mark="$(mark_next)"
-    # ss 出口会独占一个本地代理端口，先确认这个端口没被别人占着
+    # ss 出口独占一个本地代理端口：默认按序号分配，被占用时只给新出口单独指定端口，
+    # 老出口保持原端口不动（不会重启、不会断线）
+    local lp=""
     case "$proto" in
         ss|ss2022)
-            local cand owner nb ssn
+            local cand owner np ssn
             ssn="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' '$2=="ss"||$2=="ss2022"{n++} END{print n+0}')"
             cand=$((TPROXY_BASE + ssn + 1))
-            while :; do
-                if [ "$cand" -gt "$((TPROXY_BASE + 99))" ]; then
-                    err "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 已用尽"
-                    info "请增大 TPROXY_BASE（如 28000）后重试"
-                    pause_back; return 1
-                fi
-                owner="$(port_owner "$cand" 2>/dev/null)"
-                case "$owner" in
-                    *sing-box*) ;;
-                    "") break ;;
-                esac
-                warn "端口 $cand 已被占用（$owner）"
-                info "继续新增会导致这个出口起不来。可以换一个端口段基数（如 28000），或回车取消"
-                printf ' 新端口段基数: '; read -r nb
-                case "$nb" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
-                case "$nb" in *[!0-9]*) err "请输入数字"; pause_back; return 1 ;; esac
-                TPROXY_BASE="$nb"
-                save_main_var TPROXY_BASE "$TPROXY_BASE"
-                info "端口段已改为 $TPROXY_BASE-$((TPROXY_BASE + 99))"
-                cand=$((TPROXY_BASE + ssn + 1))
-            done
+            if [ "$cand" -gt "$((TPROXY_BASE + 99))" ]; then
+                err "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 已用尽"
+                info "请在 mr.conf 里把 TPROXY_BASE 改大后重试"
+                pause_back; return 1
+            fi
+            owner="$(port_owner "$cand" 2>/dev/null)"
+            case "$owner" in
+                ""|*sing-box*) ;;
+                *)
+                    warn "默认端口 $cand 已被占用（$owner）"
+                    info "老出口不受影响，只给这个新出口指定一个本地端口"
+                    while :; do
+                        printf ' 新出口本地端口（留空取消）: '; read -r np
+                        case "$np" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
+                        case "$np" in *[!0-9]*) err "请输入数字"; continue ;; esac
+                        if [ "$np" -lt 1024 ] || [ "$np" -gt 65535 ]; then err "端口范围 1024-65535"; continue; fi
+                        if [ -n "$(port_owner "$np" 2>/dev/null)" ]; then warn "$np 也被占用，换一个"; continue; fi
+                        if grep -q "|$np\$" "$EXITS_CONF" 2>/dev/null; then warn "$np 已被其它出口使用"; continue; fi
+                        lp="$np"; break
+                    done
+                    ;;
+            esac
             ;;
     esac
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" "$lp" >> "$EXITS_CONF"
     ok "已新增出口 $name（$proto / $method，mark $mark）"
     info "正在自动下发规则（ss 出口会立即启动 sing-box）..."
     apply_all
@@ -1772,13 +1783,17 @@ exit_add() {
 
 exit_set_enable() {
     # $1=出口名 $2=1/0
-    local want="$1" val="$2" l a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12
+    local want="$1" val="$2" l a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13
     : > "$EXITS_CONF.tmp"
     while IFS= read -r l; do
         case "$l" in ''|'#'*) printf '%s\n' "$l" >> "$EXITS_CONF.tmp"; continue ;; esac
-        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 <<< "$l"
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 <<< "$l"
         if [ "$a1" = "$want" ]; then
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" >> "$EXITS_CONF.tmp"
+            if [ -n "$a13" ]; then
+                printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" "$a13" >> "$EXITS_CONF.tmp"
+            else
+                printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" >> "$EXITS_CONF.tmp"
+            fi
         else
             printf '%s\n' "$l" >> "$EXITS_CONF.tmp"
         fi
@@ -1788,11 +1803,11 @@ exit_set_enable() {
 
 exits_print_numbered() {
     # $1 = 把名称按顺序写入的文件
-    local idx=1 l name proto host port meth pass mark wgkey wgif local expect enable st
+    local idx=1 l name proto host port meth pass mark wgkey wgif local expect enable lp st
     : > "$1"
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
         [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
         printf '  %s%2s%s  %-16s %-8s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$proto" "$host" "$port" "$mark" "$st"
         printf '%s\n' "$name" >> "$1"
@@ -1843,7 +1858,7 @@ exit_del() {
             printf ' 确认删除全部 %s 个出口? 输入 yes: ' "$(exits_count)"
             read -r a
             [ "$a" = "yes" ] || { info "已取消"; rm -f "$f"; return 0; }
-            printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用' > "$EXITS_CONF"
+            printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
             printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
             apply_all >/dev/null 2>&1
             ok "已删除全部出口，相关绑定已清空"
