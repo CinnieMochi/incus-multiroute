@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.2.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.2.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -186,12 +186,15 @@ exit_fld() {
 exit_exists() { exit_get "$1" >/dev/null 2>&1; }
 
 exit_ss_port() {
-    # ss 出口的本地重定向端口 = TPROXY_BASE + 序号
-    local want="$1" l i=0
+    # ss 出口的本地代理端口 = TPROXY_BASE + 序号
+    # 只对 ss/ss2022 计数：wg 出口不占端口，不该挤掉端口号
+    local want="$1" l i=0 name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
+        IFS='|' read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable <<< "$l"
+        case "$proto" in ss|ss2022) ;; *) continue ;; esac
         i=$((i + 1))
-        if [ "${l%%|*}" = "$want" ]; then
+        if [ "$name" = "$want" ]; then
             echo $((TPROXY_BASE + i))
             return 0
         fi
@@ -530,6 +533,10 @@ apply_ss_units() {
         fi
         local lport
         lport="$(exit_ss_port "$name")"
+        if [ "$lport" -gt "$((TPROXY_BASE + 99))" ]; then
+            warn "$name: 端口 $lport 超出 $TPROXY_BASE-$((TPROXY_BASE + 99)) 范围，该出口不可用"
+            continue
+        fi
         local owner
         owner="$(port_owner "$lport" 2>/dev/null)"
         case "$owner" in
