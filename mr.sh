@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.1
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -953,7 +953,16 @@ update_menu() {
     info "远端仓库: $REPO_OWNER/$REPO_NAME ($REPO_BRANCH)"
     subline
     info "正在检查远端版本 ..."
-    rv="$(curl -fsSL --max-time 15 "$UPDATE_BASE/version.txt" 2>/dev/null | tr -d '\r\n ' || true)"
+    chk="$(mktemp -d)"
+    # codeload 不受 raw CDN 缓存影响，优先用它取版本号
+    if curl -fsSL --max-time 90 -o "$chk/src.tar.gz" \
+        "https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH" 2>/dev/null; then
+        mkdir -p "$chk/src"
+        tar -xzf "$chk/src.tar.gz" -C "$chk/src" 2>/dev/null
+        rv="$(cat "$(find "$chk/src" -maxdepth 2 -name version.txt | head -1)" 2>/dev/null | tr -d '\r\n ')"
+    fi
+    [ -n "${rv:-}" ] || rv="$(curl -fsSL -H 'Cache-Control: no-cache' --max-time 15 "$UPDATE_BASE/version.txt" 2>/dev/null | tr -d '\r\n ' || true)"
+    rm -rf "$chk"
     if [ -z "$rv" ]; then
         err "拉取远端版本失败（网络不通或仓库不可达）"
         pause_back
@@ -978,7 +987,15 @@ update_menu() {
     case "$a" in [yY]) ;; *) info "已取消，未做任何改动"; pause_back; return 0 ;; esac
     tmp="$(mktemp -d)"
     info "下载新版本 ..."
-    if ! curl -fsSL --max-time 60 -o "$tmp/mr.sh" "$UPDATE_BASE/mr.sh"; then
+    if curl -fsSL --max-time 120 -o "$tmp/src.tar.gz" \
+        "https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REPO_BRANCH" 2>/dev/null; then
+        mkdir -p "$tmp/src"
+        tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" 2>/dev/null
+        local sd2
+        sd2="$(find "$tmp/src" -maxdepth 1 -type d -name '*multiroute*' | head -1)"
+        [ -n "$sd2" ] && cp -f "$sd2/mr.sh" "$tmp/mr.sh" && cp -f "$sd2/mr-api.py" "$tmp/mr-api.py" 2>/dev/null
+    fi
+    if [ ! -f "$tmp/mr.sh" ] && ! curl -fsSL --max-time 60 -o "$tmp/mr.sh" "$UPDATE_BASE/mr.sh"; then
         err "下载失败，已放弃（当前版本未受影响）"; rm -rf "$tmp"; pause_back; return 1
     fi
     if ! bash -n "$tmp/mr.sh"; then

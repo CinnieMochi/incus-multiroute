@@ -75,7 +75,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CinnieMochi/incus-multiroute
 
 ```
 ============================================================
-        Incus MultiRoute 出口管理 v1.2.1
+        Incus MultiRoute 出口管理 v1.2.2
 ============================================================
   系统    Ubuntu 22.04.5 LTS
   版本    incus 7.2
