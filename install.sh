@@ -9,7 +9,8 @@ RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 CONF_DIR="/etc/incus-multiroute"
 DATA_DIR="/var/lib/incus-multiroute"
 
-G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; C='\033[0;36m'; N='\033[0m'
+G="$(printf '\033[0;32m')"; R="$(printf '\033[0;31m')"; Y="$(printf '\033[1;33m')"
+C="$(printf '\033[0;36m')"; N="$(printf '\033[0m')"
 ok()   { printf "%s[完成]%s %s\n" "$G" "$N" "$1"; }
 err()  { printf "%s[错误]%s %s\n" "$R" "$N" "$1"; }
 warn() { printf "%s[警告]%s %s\n" "$Y" "$N" "$1"; }
@@ -39,7 +40,7 @@ trap 'rm -rf "$TMP"' EXIT
 curl -fsSL --max-time 60 -o "$TMP/mr.sh"     "$RAW/mr.sh"     || { err "下载 mr.sh 失败"; exit 1; }
 curl -fsSL --max-time 60 -o "$TMP/mr-api.py" "$RAW/mr-api.py" || { err "下载 mr-api.py 失败"; exit 1; }
 
-sh -n "$TMP/mr.sh" 2>/dev/null || { err "mr.sh 语法校验失败，已中止"; exit 1; }
+bash -n "$TMP/mr.sh" 2>/dev/null || { err "mr.sh 语法校验失败，已中止"; exit 1; }
 python3 -c "import py_compile; py_compile.compile('$TMP/mr-api.py', doraise=True)" >/dev/null 2>&1 \
     || { err "mr-api.py 语法校验失败，已中止"; exit 1; }
 
