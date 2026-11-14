@@ -196,7 +196,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def jreply(self, obj, code=200):
-        self.reply(json.dumps(obj, ensure_ascii=False), code)
+        # 用户端 out 用 sed 's/.*"key":"\([^"]*\)".*/\1/p' 解析，必须是紧凑 JSON（冒号后不能有空格）
+        self.reply(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), code)
 
     def client_ip(self):
         return self.client_address[0]
