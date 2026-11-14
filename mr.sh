@@ -30,7 +30,7 @@ MAIN_CONF="$CONF_DIR/mr.conf"
 EXITS_CONF="$CONF_DIR/exits.conf"
 BIND_CONF="$CONF_DIR/bindings.conf"
 TOKEN_CONF="$CONF_DIR/tokens.conf"
-SS_DIR="$CONF_DIR/sslocal"
+SS_DIR="$CONF_DIR/singbox"
 CLIENT_BASE="$DATA_DIR/client/out"
 CLIENT_HASH="$CONF_DIR/client.sha256"
 CLIENT_ALLOW_CONF="$CONF_DIR/clients.conf"
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.6"
+SCRIPT_VERSION="2.0.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -49,7 +49,8 @@ BRIDGE="incusbr0"
 SUBNET_GW=""
 TPROXY_BASE="41000"
 WG_PRIVATE_KEY=""
-SS_CLIENT_CMD="/usr/local/bin/sslocal --protocol redir"
+SINGBOX_BIN="/usr/local/bin/sing-box"
+SS_CLIENT_CMD="$SINGBOX_BIN run"
 
 # ---------------------------------------------------------------- 输出
 
@@ -127,7 +128,7 @@ init_main_conf() {
         echo "SUBNET_GW="$gw""
         echo 'TPROXY_BASE="41000"'
         echo 'WG_PRIVATE_KEY=""'
-        echo 'SS_CLIENT_CMD="/usr/local/bin/sslocal --protocol redir"'
+        echo 'SS_CLIENT_CMD="/usr/local/bin/sing-box run"'
     } > "$MAIN_CONF"
     chmod 600 "$MAIN_CONF"
 }
@@ -308,51 +309,50 @@ bindings_refresh() {
 # ---------------------------------------------------------------- 规则渲染
 
 gen_nft() {
-    local elems="" redirs="" l cb
-    local ts="$(date +%Y-%m-%d\ %H:%M:%S)"
+    local elems="" l ts
+    ts="$(date +%Y-%m-%d\ %H:%M:%S)"
     elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
     {
         echo "# 由 Incus MultiRoute 生成于 $ts —— 请勿手改"
         echo 'table inet multiroute {'
-        # nft 1.0.x 要求 set/map 的右花括号在新行（同一行会报 unexpected '}'）
         printf '    set bypass4 {\n        type ipv4_addr\n        flags interval\n        elements = { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 }\n    }\n'
         if [ -n "$elems" ]; then
             printf '    map c_ip {\n        type ipv4_addr : mark\n        elements = {%s\n        }\n    }\n' "$elems"
         else
             printf '    map c_ip {\n        type ipv4_addr : mark\n    }\n'
         fi
+        # 透明代理：TCP + UDP 都走 tproxy（需要 br_netfilter=0）
         echo '    chain prerouting {'
-        echo '        type filter hook prerouting priority -160; policy accept;'
+        echo '        type filter hook prerouting priority mangle; policy accept;'
         echo "        iifname \"$BRIDGE\" ip daddr @bypass4 return"
         echo "        iifname \"$BRIDGE\" meta mark set ip saddr map @c_ip"
+        echo "        iifname \"$BRIDGE\" meta mark 0x0 return"
+        # 注意：这里绝不能加 "socket transparent 1 accept"，它会把所有包直接放行走宿主，
+        # 导致 tproxy 永远不执行（实测踩过这个坑）
+        exits_each emit_tproxy
         echo '    }'
-        echo '    chain prerouting_nat {'
-        echo '        type nat hook prerouting priority -150; policy accept;'
-        echo '        meta mark 0x0 return'
-        echo '        ip daddr @bypass4 return'
-        exits_each emit_redirect
+        # 防止外部直接访问本机代理端口（sing-box 监听 0.0.0.0）
+        echo '    chain input_guard {'
+        echo '        type filter hook input priority filter - 5; policy accept;'
+        echo "        iifname != \"$BRIDGE\" iifname != \"lo\" tcp dport $TPROXY_BASE-$((TPROXY_BASE + 99)) counter drop"
+        echo "        iifname != \"$BRIDGE\" iifname != \"lo\" udp dport $TPROXY_BASE-$((TPROXY_BASE + 99)) counter drop"
         echo '    }'
         echo '    chain postrouting {'
         echo '        type nat hook postrouting priority 100; policy accept;'
         echo '        oifname "wg-*" tcp flags syn tcp option maxseg size set 1380'
         echo '    }'
-        echo '    chain forward {'
-        echo '        type filter hook forward priority 0; policy accept;'
-        echo '        meta mark != 0x0 udp dport 443 counter drop'
-        echo '    }'
         echo '}'
     } > "$NFT_FILE"
 }
 
-emit_redirect() {
+emit_tproxy() {
     local name="$1" proto="$2" mark="$7" enable="${12}"
     [ "$enable" = "0" ] && return 0
     case "$proto" in
         ss|ss2022)
             local port
             port="$(exit_ss_port "$name")"
-            echo "        meta mark $mark meta l4proto tcp redirect to :$port"
-            echo "        meta mark $mark udp dport != 53 counter drop"
+            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } tproxy ip to :$port meta mark set 0x80000001"
             ;;
     esac
 }
@@ -425,13 +425,51 @@ mark_next() {
     echo "0x1fff"
 }
 
+ss_enabled_count() {
+    local n=0 l name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
+    while IFS= read -r l; do
+        case "$l" in ''|'#'*) continue ;; esac
+        IFS='|' read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable <<< "$l"
+        case "$proto" in
+            ss|ss2022) [ "${enable:-1}" != "0" ] && n=$((n + 1)) ;;
+        esac
+    done < "$EXITS_CONF"
+    echo "$n"
+}
+
+tproxy_routing_on() {
+    ip rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
+    ip rule add fwmark 0x80000001 lookup 1001 priority 900 2>/dev/null || true
+    ip route replace local 0.0.0.0/0 dev lo table 1001 2>/dev/null || true
+}
+
+tproxy_routing_off() {
+    ip rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
+    ip route flush table 1001 2>/dev/null || true
+}
+
+ensure_tproxy_sysctl() {
+    local cur
+    cur="$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null || echo 1)"
+    if [ "$cur" != "0" ]; then
+        printf '%s\n' '# Incus MultiRoute：TPROXY 需要关闭 br_netfilter 对桥接帧的劫持' \
+            'net.bridge.bridge-nf-call-iptables = 0' > /etc/sysctl.d/90-incus-multiroute.conf
+        sysctl -qw net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+        warn "已关闭 net.bridge.bridge-nf-call-iptables（容器间二层流量不再经过防火墙）"
+    fi
+}
+
+remove_tproxy_sysctl() {
+    rm -f /etc/sysctl.d/90-incus-multiroute.conf
+    sysctl -qw net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true
+}
+
 apply_ss_units() {
     local name proto host port method pass enable l cmd
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable <<< "$l"
         case "$proto" in ss|ss2022) ;; *) continue ;; esac
-        # systemd 单元名必须是 ASCII，中文名称会被 escape 导致 systemctl 失效，这里用 mark 命名
         local u="mr-ss-$mark.service"
         if [ "$enable" = "0" ]; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
@@ -439,26 +477,35 @@ apply_ss_units() {
         fi
         local lport
         lport="$(exit_ss_port "$name")"
-        cat > "$SS_DIR/$name.json" <<EOF
+        # sing-box：tproxy 入站（TCP+UDP），shadowsocks 出站
+        cat > "$SS_DIR/$mark.json" <<EOF
 {
-  "server": "$(json_esc "$host")",
-  "server_port": $port,
-  "password": "$(json_esc "$pass")",
-  "method": "$(json_esc "$method")",
-  "mode": "tcp_only"
+  "log": { "level": "warn" },
+  "inbounds": [{
+    "type": "tproxy", "tag": "tproxy-in",
+    "listen": "0.0.0.0", "listen_port": $lport,
+    "network": ["tcp", "udp"]
+  }],
+  "outbounds": [{
+    "type": "shadowsocks", "tag": "ss",
+    "server": "$(json_esc "$host")",
+    "server_port": $port,
+    "method": "$(json_esc "$method")",
+    "password": "$(json_esc "$pass")"
+  }]
 }
 EOF
-        chmod 600 "$SS_DIR/$name.json"
+        chmod 600 "$SS_DIR/$mark.json"
         cat > "$UNIT_DIR/$u" <<EOF
 [Unit]
-Description=Incus MultiRoute sslocal ($name)
+Description=Incus MultiRoute sing-box ($name)
 After=network-online.target incus.service
 Wants=network-online.target
 Wants=incus.service
 
 [Service]
 Type=simple
-ExecStart=$SS_CLIENT_CMD -b ${SUBNET_GW:-0.0.0.0}:$lport -c "$SS_DIR/$name.json"
+ExecStart=$SS_CLIENT_CMD -c "$SS_DIR/$mark.json"
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -468,9 +515,8 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable "$u" >/dev/null 2>&1 || true
-        systemctl restart "$u" >/dev/null 2>&1 || warn "$name: sslocal 启动失败，检查 $SS_CLIENT_CMD"
+        systemctl restart "$u" >/dev/null 2>&1 || warn "$name: sing-box 启动失败，看 journalctl -u $u"
     done < "$EXITS_CONF"
-    # 清理已删除出口遗留的单元
     local f n
     for f in "$UNIT_DIR"/mr-ss-*.service; do
         [ -e "$f" ] || continue
@@ -528,6 +574,13 @@ apply_all() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     if [ "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = "1" ]; then
         sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 && info "rp_filter: 1 -> 2（策略路由必需，仅在严格模式时调整）"
+    fi
+    if [ "$(ss_enabled_count)" -gt 0 ]; then
+        ensure_tproxy_sysctl
+        tproxy_routing_on
+        ok "透明代理已就绪（TCP+UDP tproxy）"
+    else
+        tproxy_routing_off
     fi
     ensure_boot_unit
     ok "全部下发完成"
@@ -804,7 +857,7 @@ sync_timer_state() {
 # ---------------------------------------------------------------- 组件环境
 
 wg_installed()      { has_cmd wg; }
-sslocal_installed() { has_cmd sslocal; }
+singbox_installed() { has_cmd sing-box; }
 
 wg_iface_count() {
     ip -o link show type wireguard 2>/dev/null | wc -l | tr -d ' '
@@ -817,9 +870,9 @@ ss_active_units() {
 comp_line() {
     local wg_badge ss_badge ss_n
     if wg_installed; then wg_badge="${GREEN}已安装${NC}"; else wg_badge="${RED}未安装${NC}"; fi
-    if sslocal_installed; then ss_badge="${GREEN}已安装${NC}"; else ss_badge="${RED}未安装${NC}"; fi
+    if singbox_installed; then ss_badge="${GREEN}已安装${NC}"; else ss_badge="${RED}未安装${NC}"; fi
     ss_n="$(ss_active_units)"
-    printf '  %swireguard-tools%s %b   %ssslocal%s %b（运行中 %s 个出口）\n' "$BLUE" "$NC" "$wg_badge" "$BLUE" "$NC" "$ss_badge" "$ss_n"
+    printf '  %swireguard-tools%s %b   %ssing-box%s %b（运行中 %s 个出口）\n' "$BLUE" "$NC" "$wg_badge" "$BLUE" "$NC" "$ss_badge" "$ss_n"
 }
 
 install_wireguard() {
@@ -836,60 +889,48 @@ install_wireguard() {
     return 1
 }
 
-install_sslocal() {
-    local arch url tmp bin suffix ver
-    if sslocal_installed; then
-        ver="$(sslocal --version 2>&1 | head -1)"
-        case "$ver" in
-            *GLIBC*) warn "已安装的 sslocal 与当前系统 glibc 不兼容，将重新安装"; rm -f /usr/local/bin/sslocal ;;
-            *) ok "sslocal 已安装（$ver），跳过"; return 0 ;;
-        esac
-    fi
-    info "尝试从 apt 安装 shadowsocks-rust ..."
-    apt-get update -qq >/dev/null 2>&1 || true
-    if apt-get install -y shadowsocks-rust >/dev/null 2>&1 && sslocal_installed; then
-        ok "sslocal 安装完成（apt）"
+install_singbox() {
+    local arch url tmp bin ver
+    if singbox_installed; then
+        ok "sing-box 已安装（$("$SINGBOX_BIN" version 2>/dev/null | head -1)），跳过"
         return 0
     fi
     case "$(uname -m)" in
-        x86_64)  arch="x86_64" ;;
-        aarch64) arch="aarch64" ;;
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
         *) err "不支持的架构: $(uname -m)"; return 1 ;;
     esac
-    has_cmd jq || { err "需要 jq 才能解析 release 列表"; return 1; }
+    # 优先用 releases/latest 的重定向取版本号：不走 API，避免 60 次/小时的限流
+    local tag ver
+    tag="$(curl -sIL --max-time 25 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null \
+        | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p' | head -1)"
+    if [ -n "$tag" ]; then
+        ver="${tag#v}"
+        url="https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-$ver-linux-$arch.tar.gz"
+    else
+        # 兜底：走 API
+        has_cmd jq || { err "需要 jq 才能解析 release 列表"; return 1; }
+        url="$(curl -s --max-time 25 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | jq -r '.assets[].browser_download_url' 2>/dev/null | grep -m1 "linux-$arch.tar.gz" || true)"
+    fi
+    [ -n "$url" ] || { err "未取到 sing-box 下载地址（网络受限？）"; return 1; }
+    info "下载 $url ..."
     tmp="$(mktemp -d)"
-    # 先 musl（静态，跨发行版通用），再 gnu（动态，可能要求更新的 glibc）
-    for suffix in "unknown-linux-musl.tar.xz" "unknown-linux-gnu.tar.xz"; do
-        url="$(curl -s --max-time 25 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-            | jq -r '.assets[].browser_download_url' 2>/dev/null | grep -m1 "$arch-$suffix" || true)"
-        [ -n "$url" ] || continue
-        info "下载 $url ..."
-        rm -rf "$tmp"; mkdir -p "$tmp"
-        if ! curl -fsSL --max-time 180 -o "$tmp/ss.tar.xz" "$url"; then
-            warn "下载失败，尝试下一个构建"
-            continue
-        fi
-        tar -xJf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1 || tar -xf "$tmp/ss.tar.xz" -C "$tmp" >/dev/null 2>&1
-        bin="$(find "$tmp" -maxdepth 2 -type f -name sslocal 2>/dev/null | head -1)"
-        [ -n "$bin" ] || { warn "包里没有 sslocal，尝试下一个构建"; continue; }
-        install -m 755 "$bin" /usr/local/bin/sslocal
-        ver="$(/usr/local/bin/sslocal --version 2>&1 | head -1)"
-        case "$ver" in
-            *GLIBC*|"")
-                warn "该构建无法运行（$ver），回退下一个构建"
-                rm -f /usr/local/bin/sslocal
-                continue
-                ;;
-            *)
-                rm -rf "$tmp"
-                ok "sslocal 安装完成（$ver）"
-                return 0
-                ;;
-        esac
-    done
+    if ! curl -fsSL --max-time 180 -o "$tmp/sb.tar.gz" "$url"; then
+        err "下载失败"; rm -rf "$tmp"; return 1
+    fi
+    tar -xzf "$tmp/sb.tar.gz" -C "$tmp" >/dev/null 2>&1
+    bin="$(find "$tmp" -maxdepth 3 -type f -name sing-box | head -1)"
+    if [ -z "$bin" ]; then
+        err "压缩包里没找到 sing-box"; rm -rf "$tmp"; return 1
+    fi
+    install -m 755 "$bin" "$SINGBOX_BIN"
     rm -rf "$tmp"
-    err "sslocal 安装失败：请手动放置可运行的二进制到 /usr/local/bin/sslocal"
-    return 1
+    ver="$("$SINGBOX_BIN" version 2>/dev/null | head -1)"
+    if [ -z "$ver" ]; then
+        err "sing-box 安装后无法运行"; return 1
+    fi
+    ok "sing-box 安装完成（$ver）"
 }
 
 nftables_guard() {
@@ -968,19 +1009,20 @@ deps_check_update() {
         info "wireguard-tools 未安装，跳过"
     fi
     subline
-    if sslocal_installed; then
-        printf '  %-20s %s\n' "sslocal 路径" "$(command -v sslocal)"
-        latest="$(curl -s --max-time 15 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null || true)"
-        printf '  %-20s %s\n' "shadowsocks-rust 最新" "${latest:-未知}"
+    if singbox_installed; then
+        printf "  %-20s %s\n" "sing-box 路径" "$(command -v sing-box)"
+        printf '  %-20s %s\n' "当前版本" "$("$SINGBOX_BIN" version 2>/dev/null | head -1)"
+        latest="$(curl -s --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null || true)"
+        printf '  %-20s %s\n' "sing-box 最新发布" "${latest:-未知}"
         printf ' 是否重新下载并覆盖为最新版? [y/N]: '
         read -r a
         case "$a" in
-            [yY]) rm -f /usr/local/bin/sslocal
-                  install_sslocal ;;
-            *) info "已跳过 sslocal" ;;
+            [yY]) rm -f "$SINGBOX_BIN"
+                  install_singbox ;;
+            *) info "已跳过 sing-box" ;;
         esac
     else
-        info "sslocal 未安装，跳过"
+        info "sing-box 未安装，跳过"
     fi
     subline
     info "组件更新不影响出口配置，也不会重启 incus 或 nftables 服务"
@@ -996,8 +1038,8 @@ deps_menu() {
         printf '        nftables / iproute2 / curl / jq / python3 / ca-certificates\n'
         printf '  %s[2]%s 隧道组件 · wg\n' "$GREEN" "$NC"
         printf '        wireguard-tools —— 使用 wg 出口时必需\n'
-        printf '  %s[3]%s 隧道组件 · ss\n' "$GREEN" "$NC"
-        printf '        shadowsocks-rust 客户端 sslocal —— 使用 ss / ss2022 出口时必需\n'
+        printf '  %s[3]%s 隧道组件 · ss / ss2022（sing-box）\n' "$GREEN" "$NC"
+        printf '        sing-box 客户端 —— 使用 ss / ss2022 出口时必需（支持 TCP+UDP）\n'
         printf '  %s[4]%s 全部安装（1 + 2 + 3）\n' "$GREEN" "$NC"
         printf '  %s[5]%s 检查组件更新（已装的才会检查）\n' "$GREEN" "$NC"
         printf '  ------------------------------------------------------------\n'
@@ -1008,8 +1050,8 @@ deps_menu() {
         case "$c" in
             1) install_base; pause_back ;;
             2) install_wireguard; pause_back ;;
-            3) install_sslocal; pause_back ;;
-            4) install_base; install_wireguard; install_sslocal; pause_back ;;
+            3) install_singbox; pause_back ;;
+            4) install_base; install_wireguard; install_singbox; pause_back ;;
             5) deps_check_update; pause_back ;;
             0) return 0 ;;
             *) echo "无效选择"; sleep 1 ;;
@@ -1121,7 +1163,7 @@ uninstall_all() {
     title "一键卸载 Incus MultiRoute"
     warn "将删除：nft 表 inet multiroute、wg 出口接口与策略路由、全部 mr-* 单元、"
     warn "        /etc/incus-multiroute、/var/lib/incus-multiroute、/usr/local/bin/mr 与 mr-api.py"
-    info "不会自动卸载 wireguard-tools / sslocal 二进制，也不会动 incus 与其它面板的表"
+    info "不会自动卸载 wireguard-tools / sing-box 二进制，也不会动 incus 与其它面板的表"
     subline
     printf ' %s第一次确认%s —— 输入 yes 继续，其它任意键取消: ' "$YELLOW" "$NC"
     read -r a1
@@ -1163,6 +1205,10 @@ uninstall_all() {
         [ -n "$wgif" ] && ip link del "$wgif" 2>/dev/null || true
     done < "$EXITS_CONF" 2>/dev/null
 
+    info "清理透明代理策略路由与 sysctl ..."
+    tproxy_routing_off 2>/dev/null || true
+    remove_tproxy_sysctl 2>/dev/null || true
+
     info "删除 nft 表 ..."
     nft delete table inet multiroute 2>/dev/null && ok "已删除 inet multiroute" || info "无 nft 表需要删除"
 
@@ -1176,15 +1222,15 @@ uninstall_all() {
     info "删除单元文件与目录 ..."
     rm -f /etc/systemd/system/mr-*.service /etc/systemd/system/mr-*.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
-    printf ' 是否一并卸载依赖组件 wireguard-tools / sslocal? 输入 yes 卸载（其它保留）: '
+    printf ' 是否一并卸载依赖组件 wireguard-tools / sing-box? 输入 yes 卸载（其它保留）: '
     read -r a3
     if [ "$a3" = "yes" ]; then
         if dpkg -s wireguard-tools >/dev/null 2>&1; then
             apt-get remove -y wireguard-tools >/dev/null 2>&1 && info "已卸载 wireguard-tools" || warn "wireguard-tools 卸载失败"
         fi
-        rm -f /usr/local/bin/sslocal && info "已删除 /usr/local/bin/sslocal"
+        rm -f "$SINGBOX_BIN" && info "已删除 sing-box"
     else
-        info "已保留 wireguard-tools / sslocal（以后要用可直接复用）"
+        info "已保留 wireguard-tools / sing-box（以后要用可直接复用）"
     fi
 
     rm -rf "$CONF_DIR" "$DATA_DIR"
@@ -1192,7 +1238,7 @@ uninstall_all() {
     # 一并清掉历次自更新留下的备份
     rm -f /usr/local/bin/mr.bak.* /usr/local/bin/mr-api.py.bak.* 2>/dev/null || true
     subline
-    ok "卸载完成（wireguard-tools / sslocal / incus 均未改动）"
+    ok "卸载完成（wireguard-tools / sing-box / incus 均未改动）"
     printf '\n'
     exit 0
 }
@@ -1216,7 +1262,7 @@ doctor() {
     has_cmd incus;  check_item "incus 命令" "$?" "容器管理依赖"
     has_cmd nft;    check_item "nftables" "$?" "规则下发依赖"
     has_cmd python3; check_item "python3" "$?" "API 服务依赖"
-    has_cmd sslocal; check_item "sslocal（ss-rust）" "$?" "ss/ss2022 出口依赖"
+    has_cmd sing-box; check_item "sing-box" "$?" "ss/ss2022 出口依赖（TCP+UDP）"
     has_cmd wg;     check_item "wireguard-tools" "$?" "wg 出口依赖"
     [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; check_item "ip_forward=1" "$?" "转发必需"
     local rpv
@@ -1229,8 +1275,20 @@ doctor() {
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
+    if [ "$(ss_enabled_count 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+        if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "0" ]; then
+            check_item "br_netfilter 已关闭" 0 "TPROXY 必需"
+        else
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter 未关闭" "TPROXY 不通，按 10 重新下发"
+        fi
+        if ip rule show 2>/dev/null | grep -q "lookup 1001"; then
+            check_item "tproxy 策略路由" 0 "fwmark 0x80000001 → table 1001"
+        else
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "tproxy 策略路由" "缺失，按 10 重新下发"
+        fi
+    fi
     if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
-        check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"
+        check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"，
     else
         printf '  %s[提示]%s %-26s 未开启（可选功能，菜单 9 → 7 开启）\n' "$YELLOW" "$NC" "自动校验定时器"
     fi
@@ -1347,8 +1405,8 @@ exit_add() {
     # 依赖前置检查：缺客户端就不再往下问
     case "$proto" in
         ss|ss2022)
-            if ! sslocal_installed; then
-                err "还没有安装 shadowsocks-rust 客户端（sslocal）"
+            if ! singbox_installed; then
+                err "还没有安装 sing-box（ss/ss2022 客户端）"
                 info "请先到 菜单 [14] → [3] 安装，装完再回来新增 $proto 出口"
                 info "或在 菜单 [14] → [4] 一次装齐所有依赖"
                 pause_back
@@ -1423,7 +1481,7 @@ exit_add() {
     mark="$(mark_next)"
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
     ok "已新增出口 $name（$proto / $method，mark $mark）"
-    info "正在自动下发规则（ss 出口会立即启动 sslocal）..."
+    info "正在自动下发规则（ss 出口会立即启动 sing-box）..."
     apply_all
     pause_back
 }
