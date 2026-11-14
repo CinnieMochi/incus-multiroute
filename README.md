@@ -2,11 +2,32 @@
 
 **给 Incus（LXC）宿主机用的多出口管理脚本。** 让每个容器从不同的落地 IP 出网，全部操作在菜单里完成。
 
-当前版本：**v2.0.1**
+## 一键安装
 
-- 支持协议：**Shadowsocks / Shadowsocks 2022（TCP + UDP 全代理）**、**WireGuard（全协议）**
-- 全部交互式，不需要记命令
-- 只维护自己的一张 nft 表，不碰 incus 与其它面板的规则
+在 **Incus 宿主机**上以 root 执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CinnieMochi/incus-multiroute/main/install.sh | bash
+```
+
+装完输入下面的命令打开菜单：
+
+```bash
+mr
+```
+
+> 连不上 GitHub 时看 [安装与升级](#六安装与升级) 的离线安装方法。
+
+### 它是什么
+
+| 项目 | 内容 |
+|---|---|
+| 运行位置 | Incus 宿主机（入口机），不是容器里 |
+| 作用 | 给每个容器绑定独立出口，容器零配置透明出网 |
+| 支持协议 | **Shadowsocks**、**Shadowsocks 2022**（TCP + UDP 全代理）、**WireGuard**（全协议） |
+| 操作方式 | 全交互式菜单，不需要记命令 |
+| 隔离性 | 只维护自己的一张 nft 表，不碰 incus 与其它面板的规则 |
+| 当前版本 | **v2.0.1** |
 
 ---
 
@@ -17,7 +38,7 @@
 3. 名词解释
 4. 工作原理（数据面 / 控制面）
 5. 使用前提
-6. 一键安装
+6. 安装与升级
 7. 第一次配置：从零到能用
 8. 菜单逐项详解
 9. 落地机怎么搭
@@ -231,21 +252,55 @@ API 会校验三件事：**来源 IP 是否绑定**、**是否在授权白名单
 
 ---
 
-## 六、一键安装
+## 六、安装与升级
 
-在宿主机上执行：
+### 1. 在线安装（推荐）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CinnieMochi/incus-multiroute/main/install.sh | bash
 ```
 
-装完直接输入 mr 就能看到菜单。
+装完输入 mr 打开菜单。
 
-### 离线安装
+安装脚本会做这些事：
 
-如果服务器连不上 GitHub，把 install.sh、mr.sh、mr-api.py、version.txt、client/out 放在同一个目录，然后执行 bash install.sh。
+| 步骤 | 说明 |
+|---|---|
+| 下载脚本 | 优先按 commit SHA 从 codeload 拉取，避免 CDN 缓存拿到旧版本；失败则回退 raw |
+| 安装主脚本 | 复制到 /usr/local/bin/mr 并加执行权限 |
+| 安装 API | 复制到 /usr/local/bin/mr-api.py |
+| 装 API 服务 | 创建并启用 mr-api.service，立刻启动 |
+| 配置用户端 | 把 client/out 里的默认 API 地址改写成本机网桥网关，再放入基准目录 |
+| 改写容器侧地址 | 后续推送到容器的 out 会自动指向本机网桥网关 |
 
-脚本检测到本地有 mr.sh 就会走离线模式，不联网。
+安全提示：安装脚本只写 /usr/local/bin 与 /etc、/var/lib 下自己的目录，不会 flush 任何 nft 表、不会重启 incus。
+
+### 2. 离线安装
+
+服务器连不上 GitHub 时：
+
+1. 在一台能上网的机器上把仓库下载下来
+2. 把 **install.sh、mr.sh、mr-api.py、version.txt、client/out** 放到服务器上同一个目录
+3. 在该目录执行：
+
+```bash
+bash install.sh
+```
+
+脚本检测到本地有 mr.sh 就会走离线模式，全程不联网。
+
+### 3. 升级
+
+| 方式 | 操作 |
+|---|---|
+| 菜单升级 | 输入 mr → 菜单 15，检查并更新。会自动备份旧版本为 mr.bak.版本号 |
+| 重新安装 | 再跑一次上面的在线安装命令，会覆盖为新版本，配置不动 |
+
+升级**不会**清空出口与绑定，也不会重启 incus。
+
+### 4. 卸载
+
+菜单 99，需要输入两次 yes。详见第八节「99 一键卸载」。
 
 ---
 
