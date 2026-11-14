@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.0.3
+# Incus MultiRoute 宿主机出口管理脚本 v2.1.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.1.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -214,17 +214,43 @@ bindings_each() {
     done < "$BIND_CONF"
 }
 
+ip2int() {
+    local IFS=.
+    set -- $1
+    echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+}
+
+in_bridge_subnet() {  # $1=IP  $2=网桥 CIDR（如 10.10.0.1/22）
+    local ip="$1" cidr="$2" net len mi ipi neti
+    net="${cidr%/*}"; len="${cidr#*/}"
+    case "$ip" in ''|*[!0-9.]*) return 1 ;; esac
+    case "$net" in ''|*[!0-9.]*) return 1 ;; esac
+    case "$len" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$len" -ge 1 ] && [ "$len" -le 32 ] || return 1
+    ipi="$(ip2int "$ip")"; neti="$(ip2int "$net")"
+    mi=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    [ $(( ipi & mi )) -eq $(( neti & mi )) ]
+}
+
 containers_scan() {
     # 输出：容器名<TAB>IPv4
     has_cmd incus || return 1
-    # CSV 里带引号或 "(eth0)" 后缀时要清洗：去掉引号、括号后缀，多地址取第一个
-    incus list --format=csv -c n4 2>/dev/null | awk -F, '{
-        n = $1; gsub(/"/, "", n)
-        ip = $2; gsub(/"/, "", ip); sub(/ *\(.*/, "", ip); split(ip, a, " "); ip = a[1]
-        if (ip != "") printf "%s\t%s\n", n, ip
-    }'
+    # 容器可能有多张网卡/多个地址：优先取网桥网段内的地址
+    # （否则用户在容器里加个 dummy 地址，就会把绑定记录带偏）
+    local cidr n ips a best first
+    cidr="$(detect_subnet 2>/dev/null)"
+    while IFS=, read -r n ips; do
+        n="${n//\"/}"; ips="${ips//\"/}"
+        ips="${ips%%(*}"
+        best=""; first=""
+        for a in $ips; do
+            [ -n "$first" ] || first="$a"
+            if [ -n "$cidr" ] && in_bridge_subnet "$a" "$cidr"; then best="$a"; break; fi
+        done
+        [ -n "$best" ] || best="$first"
+        [ -n "$best" ] && printf '%s\t%s\n' "$n" "$best"
+    done < <(incus list --format=csv -c n4 2>/dev/null)
 }
-
 container_ip() {
     local name="$1"
     containers_scan 2>/dev/null | awk -F'\t' -v n="$name" '$1==n {print $2; exit}'
@@ -1280,6 +1306,137 @@ uninstall_all() {
     exit 0
 }
 
+# ---------------------------------------------------------------- 安全加固
+
+host_has_ipv4() { ip -4 route show default 2>/dev/null | grep -q default; }
+host_has_ipv6() { ip -6 route show default 2>/dev/null | grep -q default; }
+
+# 找出容器的网卡设备名（通常 eth0，但不写死）
+container_nic_dev() {
+    local c="$1" dev
+    dev="$(incus config device show "$c" 2>/dev/null | awk '
+        /^[A-Za-z0-9_.-]+:$/ { name=$0; sub(/:$/, "", name) }
+        /nictype:|network:/ { if (name != "") { print name; exit } }
+    ')"
+    printf '%s' "${dev:-eth0}"
+}
+
+sec_flag() {  # $1=容器 $2=设备 $3=ipv4_filtering|ipv6_filtering  → 输出 true/空
+    incus config device get "$1" "$2" "security.$3" 2>/dev/null
+}
+
+sec_apply_one() {  # $1=容器  $2=1 开启 / 0 关闭
+    local c="$1" mode="$2" dev rc=0 k
+    dev="$(container_nic_dev "$c")"
+    for k in ipv4_filtering ipv6_filtering; do
+        case "$k" in
+            ipv4_filtering) host_has_ipv4 || continue ;;
+            ipv6_filtering) host_has_ipv6 || continue ;;
+        esac
+        if [ "$mode" = "1" ]; then
+            incus config device set "$c" "$dev" "security.$k" true >/dev/null 2>&1 || rc=1
+        else
+            incus config device unset "$c" "$dev" "security.$k" >/dev/null 2>&1 || rc=1
+        fi
+    done
+    return $rc
+}
+
+sec_status_table() {
+    local c dev v4 v6 f4 f6 line
+    if ! host_has_ipv4; then f4="(宿主机无 IPv4)"; fi
+    if ! host_has_ipv6; then f6="(宿主机无 IPv6)"; fi
+    printf '  %-22s %-16s %-16s
+' "容器" "IPv4 防伪" "IPv6 防伪"
+    subline
+    for c in $(incus list --format=csv -c n 2>/dev/null | tail -n +2); do
+        dev="$(container_nic_dev "$c")"
+        v4="$(sec_flag "$c" "$dev" ipv4_filtering)"
+        v6="$(sec_flag "$c" "$dev" ipv6_filtering)"
+        [ "$v4" = "true" ] && v4="${GREEN}已开${NC}" || v4="${YELLOW}未开${NC}"
+        [ "$v6" = "true" ] && v6="${GREEN}已开${NC}" || v6="${YELLOW}未开${NC}"
+        [ -n "$f4" ] && v4="$f4"
+        [ -n "$f6" ] && v6="$f6"
+        printf '  %-22s %-25b %-25b
+' "$c" "$v4" "$v6"
+    done
+}
+
+sec_apply_all() {
+    local mode="$1" c ok=0 fail=0 n=0
+    if ! host_has_ipv4 && ! host_has_ipv6; then
+        err "宿主机既没有 IPv4 也没有 IPv6 默认路由，无法加固"
+        return 1
+    fi
+    title "安全加固 · $([ "$mode" = "1" ] && echo 开启 || echo 关闭)"
+    info "将处理: $(host_has_ipv4 && printf 'IPv4 ') $(host_has_ipv6 && printf 'IPv6 ')"
+    if ! host_has_ipv6; then info "宿主机没有 IPv6 默认路由，跳过 ipv6_filtering"; fi
+    if ! host_has_ipv4; then info "宿主机没有 IPv4 默认路由，跳过 ipv4_filtering"; fi
+    subline
+    for c in $(incus list --format=csv -c n 2>/dev/null | tail -n +2); do
+        n=$((n + 1))
+        if sec_apply_one "$c" "$mode"; then
+            ok=$((ok + 1))
+        else
+            fail=$((fail + 1))
+            warn "$c 设置失败"
+        fi
+    done
+    subline
+    ok "处理完成: 成功 $ok / 失败 $fail（共 $n 个容器）"
+    if [ "$mode" = "1" ]; then
+        info "如某个容器出现断网，用本菜单 [4] 关闭它的加固再排查"
+        info "少数场景（容器内含 Docker 多网段、Tailscale 等）可能需要重启容器才完全生效"
+    fi
+}
+
+sec_menu() {
+    local c dev a
+    while true; do
+        title "安全加固"
+        printf '  %s宿主协议族%s  IPv4: %s   IPv6: %s
+' "$BLUE" "$NC" \
+            "$(host_has_ipv4 && echo 有 || echo 无)" "$(host_has_ipv6 && echo 有 || echo 无)"
+        info "加固内容: 禁止容器伪造源 IP（security.ipv4_filtering / security.ipv6_filtering）"
+        info "作用: 防止容器借别人的 IP 发包（反射攻击、日志污染、绕过按 IP 的限制）"
+        subline
+        printf '    %s[1]%s 查看各容器加固状态
+' "$GREEN" "$NC"
+        printf '    %s[2]%s 全部开启（按宿主机协议族自动选择）
+' "$GREEN" "$NC"
+        printf '    %s[3]%s 指定容器开启
+' "$GREEN" "$NC"
+        printf '    %s[4]%s 指定容器关闭
+' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回
+' "$YELLOW" "$NC"
+        line
+        printf '请输入选项 [0-4]: '
+        read -r a || return 0
+        case "$a" in
+            0|"") return 0 ;;
+            1) title "加固状态"; sec_status_table; pause_back ;;
+            2)
+                printf ' 确认给 %s 个容器开启防伪? 输入 yes 继续: ' "$(incus list --format=csv -c n 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+                read -r a
+                [ "$a" = "yes" ] || { info "已取消"; pause_back; continue; }
+                sec_apply_all 1; pause_back
+                ;;
+            3)
+                c="$(pick_container)" || { pause_back; continue; }
+                if sec_apply_one "$c" 1; then ok "已为 $c 开启加固"; else err "$c 设置失败"; fi
+                pause_back
+                ;;
+            4)
+                c="$(pick_container)" || { pause_back; continue; }
+                if sec_apply_one "$c" 0; then ok "已为 $c 关闭加固"; else err "$c 设置失败"; fi
+                pause_back
+                ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
 # ---------------------------------------------------------------- 体检
 
 doctor() {
@@ -1358,8 +1515,8 @@ doctor() {
         done < "$BIND_CONF"
         if [ -n "$nofilter" ]; then
             printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv4_filtering" "$nofilter"
-            info "这些容器可以伪造源 IP 冒用他人出口；建议："
-            info "  incus config device set <容器> eth0 security.ipv4_filtering true"
+            info "这些容器可以伪造源 IP 发包（反射攻击 / 日志污染）"
+            info "处理：菜单 [16] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
         else
             check_item "容器源 IP 防伪" 0 "已绑定容器均开启 ipv4_filtering"
         fi
@@ -1938,11 +2095,12 @@ menu_main() {
         printf '  %s【环境】%s\n' "$CYAN" "$NC"
         printf '    %s[14]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
         printf '    %s[15]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
+        printf '    %s[16]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
         printf '    %s[99]%s 一键卸载 Incus MultiRoute\n' "$RED" "$NC"
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
         line
-        printf '请输入选项 [0-15 / 99]: '
+        printf '请输入选项 [0-16 / 99]: '
         read -r choice || exit 0
         case "$choice" in
             1) exits_list ;;
@@ -1960,6 +2118,7 @@ menu_main() {
             13) install_self ;;
             14) deps_menu ;;
             15) update_menu ;;
+            16) sec_menu ;;
             99) uninstall_all ;;
             0) printf '%s再见%s\n' "$YELLOW" "$NC"; exit 0 ;;
             *) echo "无效选择"; sleep 1 ;;
@@ -2007,6 +2166,7 @@ Incus MultiRoute 宿主机出口管理
   mr refresh            按 incus 实际状态校正容器 IP 后下发
   mr sync               校验并下发用户端 out（供定时器调用）
   mr doctor             环境体检
+  mr harden             为所有容器开启源 IP 防伪（IPv4/IPv6 按宿主机实际情况）
   mr --install          安装到 /usr/local/bin/mr
 
 配置目录: $CONF_DIR
@@ -2033,6 +2193,8 @@ case "${1:-menu}" in
         main; client_sync quiet ;;
     doctor)
         main; doctor ;;
+    harden)
+        main; sec_apply_all 1 ;;
     --install)
         require_root; main; install_self ;;
     help|-h|--help)
