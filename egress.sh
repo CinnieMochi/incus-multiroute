@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Shlii-Egress 宿主机出口管理脚本 v1.0
+# IncuShlii Egress 宿主机出口管理脚本 v1.1.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与 lxc.sh（Shlii-Incus 容器管理）保持一致
 #
@@ -1298,7 +1298,7 @@ banner_status() {
     b_count="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | grep -c '|' || true)"
     c_count="$(containers_scan 2>/dev/null | grep -c '	' || true)"
     line
-    printf '        %sShlii-Egress 出口管理 v1.0%s\n' "$CYAN" "$NC"
+    printf '        %sIncuShlii Egress 出口管理 v%s%s\n' "$CYAN" "$SCRIPT_VERSION" "$NC"
     line
     printf '  %s系统%s  %s   %sincus%s  %s\n' "$BLUE" "$NC" "$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)" "$BLUE" "$NC" "$incus_ver"
     printf '  %s网桥%s  %s    %s网关%s  %s\n' "$BLUE" "$NC" "$BRIDGE" "$BLUE" "$NC" "$bridge_gw"
