@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.0.2
+# Incus MultiRoute 宿主机出口管理脚本 v2.0.3
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.0.3"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -472,6 +472,7 @@ remove_tproxy_sysctl() {
 }
 
 apply_ss_units() {
+    local force="${1:-0}"
     local name proto host port method pass enable l cmd
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
@@ -485,7 +486,8 @@ apply_ss_units() {
         local lport
         lport="$(exit_ss_port "$name")"
         # sing-box：tproxy 入站（TCP+UDP），shadowsocks 出站
-        cat > "$SS_DIR/$mark.json" <<EOF
+        local newcfg newunit
+        newcfg="$(cat <<EOF
 {
   "log": { "level": "warn" },
   "inbounds": [{
@@ -502,8 +504,8 @@ apply_ss_units() {
   }]
 }
 EOF
-        chmod 600 "$SS_DIR/$mark.json"
-        cat > "$UNIT_DIR/$u" <<EOF
+)"
+        newunit="$(cat <<EOF
 [Unit]
 Description=Incus MultiRoute sing-box ($name)
 After=network-online.target incus.service
@@ -520,9 +522,24 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable "$u" >/dev/null 2>&1 || true
-        systemctl restart "$u" >/dev/null 2>&1 || warn "$name: sing-box 启动失败，看 journalctl -u $u"
+)"
+        # 只有配置真的变了才重启：新增/删除/停用出口时，不能打断其它出口的连接
+        local changed=1
+        if [ -f "$SS_DIR/$mark.json" ] && [ -f "$UNIT_DIR/$u" ] \
+            && [ "$newcfg" = "$(cat "$SS_DIR/$mark.json")" ] \
+            && [ "$newunit" = "$(cat "$UNIT_DIR/$u")" ]; then
+            changed=0
+        fi
+        if [ "$changed" = "1" ]; then
+            printf '%s\n' "$newcfg" > "$SS_DIR/$mark.json"
+            printf '%s\n' "$newunit" > "$UNIT_DIR/$u"
+            chmod 600 "$SS_DIR/$mark.json"
+        fi
+        if [ "$changed" = "1" ] || [ "$force" = "1" ] || ! systemctl is-active --quiet "$u" 2>/dev/null; then
+            systemctl daemon-reload
+            systemctl enable "$u" >/dev/null 2>&1 || true
+            systemctl restart "$u" >/dev/null 2>&1 || warn "$name: sing-box 启动失败，看 journalctl -u $u"
+        fi
     done < "$EXITS_CONF"
     local f n
     for f in "$UNIT_DIR"/mr-ss-*.service; do
@@ -587,13 +604,14 @@ apply_nft_only() {
 }
 
 apply_all() {
+    local force="${1:-0}"
     load_conf
     require_root
     title "下发规则"
     apply_nft_only || { err "nft 下发失败"; pause_back; return 1; }
     ok "nft 规则已加载"
     gen_wg
-    apply_ss_units
+    apply_ss_units "$force"
     # 只做最小必要改动：ip_forward 本就是 incus 要求开启的；
     # rp_filter 仅在严格模式(1)时放宽为宽松(2)，已经是 0 或 2 就完全不去动它。
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -736,7 +754,7 @@ client_revoke_all() {
         bind_remove "$c" >/dev/null 2>&1 || true
     done
     printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
-    apply_all >/dev/null 2>&1 || true
+    apply_nft_only >/dev/null 2>&1 || true
     subline
     ok "已回收 $cnt / $n 个容器，白名单已清空"
     pause_back
@@ -1769,7 +1787,7 @@ bind_menu_choose() {
         bind_set "$name" "$exit_name" || { pause_back; return 1; }
     fi
     bindings_refresh
-    apply_all
+    apply_nft_only
     pause_back
 }
 
@@ -1789,7 +1807,7 @@ bind_menu_remove() {
     rm -f "$f"
     [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
     bind_clear "$name"
-    apply_all
+    apply_nft_only
     pause_back
 }
 
@@ -1934,9 +1952,9 @@ menu_main() {
             5) containers_list ;;
             6) bind_menu_choose ;;
             7) bind_menu_remove ;;
-            8) bindings_refresh; apply_all; pause_back ;;
+            8) bindings_refresh; apply_nft_only; pause_back ;;
             9) client_menu ;;
-            10) apply_all; pause_back ;;
+            10) apply_all 1; pause_back ;;
             11) doctor ;;
             12) api_menu ;;
             13) install_self ;;
@@ -1984,7 +2002,7 @@ Incus MultiRoute 宿主机出口管理
 
 用法:
   mr                    进入交互菜单
-  mr apply              重新下发全部规则（含重启 sing-box）
+  mr apply              重新下发全部规则（强制重启 sing-box）
   mr apply-nft          只重建 nft 规则（绑定变化时用，不打断现有连接）
   mr refresh            按 incus 实际状态校正容器 IP 后下发
   mr sync               校验并下发用户端 out（供定时器调用）
@@ -2006,11 +2024,11 @@ case "${1:-menu}" in
     menu|"")
         main; menu_main ;;
     apply)
-        main; apply_all ;;
+        main; apply_all 1 ;;
     apply-nft)
         main; apply_nft_only; exit $? ;;
     refresh)
-        main; bindings_refresh; apply_all ;;
+        main; bindings_refresh; apply_nft_only ;;
     sync)
         main; client_sync quiet ;;
     doctor)
