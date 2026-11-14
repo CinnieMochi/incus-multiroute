@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.2.1
+# Incus MultiRoute 宿主机出口管理脚本 v2.3.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.3.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -47,10 +47,10 @@ UPDATE_BASE="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REPO_BRAN
 
 BRIDGE="incusbr0"
 SUBNET_GW=""
-TPROXY_BASE="41000"
+TPROXY_BASE="27000"
 WG_PRIVATE_KEY=""
 SINGBOX_BIN="/usr/local/bin/sing-box"
-TPROXY_BASE="${TPROXY_BASE:-41000}"
+TPROXY_BASE="${TPROXY_BASE:-27000}"
 SS_CLIENT_CMD="$SINGBOX_BIN run"
 
 # ---------------------------------------------------------------- 输出
@@ -127,7 +127,7 @@ init_main_conf() {
         echo '# Incus MultiRoute 主配置'
         echo "BRIDGE="$b""
         echo "SUBNET_GW="$gw""
-        echo 'TPROXY_BASE="41000"'
+        echo 'TPROXY_BASE="27000"'
         echo 'WG_PRIVATE_KEY=""'
         echo 'SS_CLIENT_CMD="/usr/local/bin/sing-box run"'
     } > "$MAIN_CONF"
@@ -138,6 +138,12 @@ load_conf() {
     ensure_dirs
     init_main_conf
     . "$MAIN_CONF"
+    # 端口段从 41000 迁到 27000：避开常见业务号段，且用户端口映射撞号时能明确报占用
+    if [ "$TPROXY_BASE" = "41000" ]; then
+        TPROXY_BASE="27000"
+        save_main_var TPROXY_BASE "27000"
+        info "端口段已从 41000 迁移到 27000-27099，需重新下发一次"
+    fi
     BRIDGE="${BRIDGE:-incusbr0}"
     [ -n "$SUBNET_GW" ] || SUBNET_GW="$(detect_gateway)"
 }
