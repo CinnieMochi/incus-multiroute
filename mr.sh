@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.1.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.2.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -382,7 +382,14 @@ emit_tproxy() {
             # ct direction original：只劫持"容器主动发起"的包。
             # 不加这一条，容器作为服务端时（如 vless / hy2），它给客户端回包也会被劫持，
             # 导致外部连接超时。实测踩过。
-            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip to :$port meta mark set 0x80000001"
+            # 指定网桥地址：sing-box 只绑网桥，代理端口不暴露到公网，
+            # 也不会和用户的端口映射抢 0.0.0.0
+            local tpaddr="${SUBNET_GW:-}"
+            if [ -n "$tpaddr" ]; then
+                echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip to $tpaddr:$port meta mark set 0x80000001"
+            else
+                echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip to :$port meta mark set 0x80000001"
+            fi
             ;;
     esac
 }
@@ -458,6 +465,18 @@ mark_next() {
     echo "0x1fff"
 }
 
+port_owner() {  # 输出占用该端口的进程名（tsv），空闲则输出空
+    ss -lntupH 2>/dev/null | awk -v p=":$1\$" '$5 ~ p {print $1" "$7; exit}'
+}
+
+tproxy_port_conflicts() {  # 列出代理端口段里被"非 sing-box"占用的端口
+    ss -lntupH 2>/dev/null | awk -v lo="$TPROXY_BASE" -v hi="$((TPROXY_BASE + 99))" '
+        {
+            p = $5; sub(/.*:/, "", p); if (p + 0 < lo || p + 0 > hi) next
+            if ($7 !~ /sing-box/) print p
+        }' | sort -un | tr '\n' ' '
+}
+
 ss_enabled_count() {
     local n=0 l name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
@@ -511,6 +530,13 @@ apply_ss_units() {
         fi
         local lport
         lport="$(exit_ss_port "$name")"
+        local owner
+        owner="$(port_owner "$lport" 2>/dev/null)"
+        case "$owner" in
+            *sing-box*) ;;
+            "") ;;
+            *) warn "$name: 端口 $lport 已被占用（$owner），该出口可能启动失败" ;;
+        esac
         # sing-box：tproxy 入站（TCP+UDP），shadowsocks 出站
         local newcfg newunit
         newcfg="$(cat <<EOF
@@ -518,7 +544,7 @@ apply_ss_units() {
   "log": { "level": "warn" },
   "inbounds": [{
     "type": "tproxy", "tag": "tproxy-in",
-    "listen": "0.0.0.0", "listen_port": $lport,
+    "listen": "${SUBNET_GW:-0.0.0.0}", "listen_port": $lport,
     "network": ["tcp", "udp"]
   }],
   "outbounds": [{
@@ -1469,6 +1495,12 @@ doctor() {
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
+    local pc
+    pc="$(tproxy_port_conflicts 2>/dev/null)"
+    if [ -n "$pc" ]; then
+        printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "代理端口被占用" "$pc"
+        info "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 归本脚本；请让用户端口映射避开"
+    fi
     if ip -6 route show default 2>/dev/null | grep -q default; then
         printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机有 IPv6 出网" "容器 IPv6 流量不会走出口（只代理 IPv4），如需隐藏请禁用容器 IPv6"
     fi
