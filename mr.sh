@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.15
+# Incus MultiRoute 宿主机出口管理脚本 v1.3.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.15"
+SCRIPT_VERSION="1.3.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1241,44 +1241,83 @@ api_listen_addr() {
 # ---------------------------------------------------------------- 出口菜单
 
 exit_add() {
-    local name proto host port method pass wgkey wgif local expect mark l
+    local name proto host port method pass wgkey wgif local expect mark
+    local methods m msel i
     clear_if_tty
     title "新增出口节点"
     printf '协议类型：\n'
-    printf '  %s[1]%s Shadowsocks 2022\n' "$GREEN" "$NC"
+    printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
     printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
     printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
-    printf '请输入协议 [1-3]: '
+    printf '  %s[0]%s 返回上一级\n' "$GREEN" "$NC"
+    printf '请输入 [0-3]: '
     read -r proto_sel
     case "$proto_sel" in
         1) proto="ss2022" ;;
         2) proto="ss" ;;
         3) proto="wg" ;;
+        0|"") info "已取消"; return 0 ;;
         *) err "无效选择"; pause_back; return 1 ;;
     esac
-    printf '名称（如 东京-01）: '; read -r name
+
+    printf '名称（如 香港-01，输入 0 返回）: '; read -r name
+    case "$name" in 0|"") info "已取消"; return 0 ;; esac
     [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
     exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
-    printf '服务器地址: '; read -r host
+
+    printf '服务器地址（输入 0 返回）: '; read -r host
+    case "$host" in 0|"") info "已取消"; return 0 ;; esac
+
     if [ "$proto" = "wg" ]; then
+        info "WireGuard 的加密算法是协议固定的（ChaCha20-Poly1305），无需选择"
         printf '端口 [51820]: '; read -r port; [ -n "$port" ] || port=51820
         ensure_wg_key || { pause_back; return 1; }
-        printf '出口机公钥: '; read -r wgkey
+        printf '出口机公钥（输入 0 返回）: '; read -r wgkey
+        case "$wgkey" in 0|"") info "已取消"; return 0 ;; esac
         printf '本机接口名 [wg-exit1]: '; read -r wgif; [ -n "$wgif" ] || wgif="wg-exit$(($(exits_count) + 1))"
-        printf '本机隧道地址（如 10.200.1.2/32）: '; read -r local
+        printf '本机隧道地址（如 10.200.1.2/32，输入 0 返回）: '; read -r local
+        case "$local" in 0|"") info "已取消"; return 0 ;; esac
         method=""; pass=""
     else
+        if [ "$proto" = "ss2022" ]; then
+            methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+            printf '\n加密方式（Shadowsocks 2022）：\n'
+        else
+            methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+            printf '\n加密方式（Shadowsocks 经典版）：\n'
+        fi
+        i=1
+        for m in $methods; do
+            printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"
+            i=$((i + 1))
+        done
+        printf '  %s[0]%s 返回上一级\n' "$GREEN" "$NC"
+        printf '请输入 [0-%s]: ' "$((i - 1))"
+        read -r msel
+        case "$msel" in 0|"") info "已取消"; return 0 ;; esac
+        case "$msel" in *[!0-9]*) err "请输入序号"; pause_back; return 1 ;; esac
+        method="$(printf '%s\n' $methods | sed -n "${msel}p")"
+        [ -n "$method" ] || { err "无效选择"; pause_back; return 1; }
+
         printf '端口 [2525]: '; read -r port; [ -n "$port" ] || port=2525
-        printf '加密方式 [2022-blake3-aes-128-gcm]: '; read -r method
-        [ -n "$method" ] || method="2022-blake3-aes-128-gcm"
-        printf '密码: '; read -r pass
+        printf '密码（输入 0 返回）: '; read -r pass
+        case "$pass" in 0|"") info "已取消"; return 0 ;; esac
+        case "$proto:$method" in
+            ss2022:2022-blake3-aes-128-gcm|ss2022:2022-blake3-chacha20-poly1305)
+                [ ${#pass} -ge 20 ] || warn "该算法要求 16 字节 base64 密码（通常 24 字符），当前 ${#pass} 字符，请确认" ;;
+            ss2022:2022-blake3-aes-256-gcm)
+                [ ${#pass} -ge 40 ] || warn "该算法要求 32 字节 base64 密码（通常 44 字符），当前 ${#pass} 字符，请确认" ;;
+        esac
         wgkey=""; wgif=""; local=""
     fi
-    printf '期望出口 IP（留空则用服务器地址）: '; read -r expect
+
+    printf '期望出口 IP（留空用服务器地址，输入 0 返回）: '; read -r expect
+    case "$expect" in 0) info "已取消"; return 0 ;; esac
     [ -n "$expect" ] || expect="$host"
     mark="$(mark_next)"
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
-    ok "已新增出口 $name（mark $mark）"
+    ok "已新增出口 $name（$proto / $method，mark $mark）"
+    info "记得回到主菜单 [10] 重新下发规则"
     pause_back
 }
 
@@ -1389,10 +1428,10 @@ bind_menu_choose() {
     printf '可选出口：\n'
     exits_each show_exit_row
     subline
-    printf '容器名: '; read -r n
-    [ -n "$n" ] || return 1
-    printf '出口名（输入 入口机 表示直出）: '; read -r e
-    [ -n "$e" ] || return 1
+    printf '容器名（输入 0 返回）: '; read -r n
+    case "$n" in 0|"") info "已取消"; return 1 ;; esac
+    printf '出口名（输入 入口机 表示直出，0 返回）: '; read -r e
+    case "$e" in 0|"") info "已取消"; return 1 ;; esac
     if [ "$e" = "入口机" ] || [ "$e" = "-" ]; then
         bind_remove "$n"
     else
@@ -1411,8 +1450,8 @@ bind_menu_remove() {
         [ -n "$n" ] && printf '  %-22s %s\n' "$n" "$ip"
     done
     subline
-    printf '容器名: '; read -r n
-    [ -n "$n" ] || return 0
+    printf '容器名（输入 0 返回）: '; read -r n
+    case "$n" in 0|"") info "已取消"; return 0 ;; esac
     bind_clear "$n"
     apply_all
     pause_back
@@ -1445,8 +1484,10 @@ client_menu() {
         read -r c
         case "$c" in
             1) client_status; pause_back ;;
-            2) printf '容器名: '; read -r cn; client_grant "$cn" ;;
-            3) printf '容器名: '; read -r cn; client_revoke "$cn" ;;
+            2) printf '容器名（输入 0 返回）: '; read -r cn
+               case "$cn" in 0|"") info "已取消" ;; *) client_grant "$cn" ;; esac ;;
+            3) printf '容器名（输入 0 返回）: '; read -r cn
+               case "$cn" in 0|"") info "已取消" ;; *) client_revoke "$cn" ;; esac ;;
             4) client_grant_all ;;
             5) client_revoke_all ;;
             6) client_sync ;;
@@ -1463,9 +1504,9 @@ client_update_base() {
     local src
     title "更新用户端基准脚本"
     info "当前基准: $CLIENT_BASE"
-    printf '新脚本路径（留空取消）: '
+    printf '新脚本路径（输入 0 或留空取消）: '
     read -r src
-    [ -n "$src" ] || return 0
+    case "$src" in 0|"") info "已取消"; return 0 ;; esac
     [ -f "$src" ] || { err "文件不存在"; pause_back; return 1; }
     cp -f "$src" "$CLIENT_BASE"
     chmod 755 "$CLIENT_BASE"
@@ -1524,12 +1565,12 @@ menu_main() {
         printf '    %s[13]%s 安装本脚本到系统\n' "$GREEN" "$NC"
         printf '  %s【环境】%s\n' "$CYAN" "$NC"
         printf '    %s[14]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
-        printf '    %s[16]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
+        printf '    %s[15]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
         printf '    %s[99]%s 一键卸载 Incus MultiRoute\n' "$RED" "$NC"
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
         line
-        printf '请输入选项 [0-14 / 16 / 99]: '
+        printf '请输入选项 [0-15 / 99]: '
         read -r choice
         case "$choice" in
             1) exits_list ;;
@@ -1546,7 +1587,7 @@ menu_main() {
             12) api_menu ;;
             13) install_self ;;
             14) deps_menu ;;
-            16) update_menu ;;
+            15) update_menu ;;
             99) uninstall_all ;;
             0) printf '%s再见%s\n' "$YELLOW" "$NC"; exit 0 ;;
             *) echo "无效选择"; sleep 1 ;;
