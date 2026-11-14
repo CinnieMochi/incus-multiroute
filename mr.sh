@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.12
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.13
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.12"
+SCRIPT_VERSION="1.2.13"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1243,9 +1243,9 @@ exit_add() {
     clear_if_tty
     title "新增出口节点"
     printf '协议类型：\n'
-    printf '  %s[1]%s ss2022\n' "$GREEN" "$NC"
-    printf '  %s[2]%s ss（经典）\n' "$GREEN" "$NC"
-    printf '  %s[3]%s wg\n' "$GREEN" "$NC"
+    printf '  %s[1]%s Shadowsocks 2022\n' "$GREEN" "$NC"
+    printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
+    printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
     printf '请输入协议 [1-3]: '
     read -r proto_sel
     case "$proto_sel" in
