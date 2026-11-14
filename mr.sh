@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.4.3
+# Incus MultiRoute 宿主机出口管理脚本 v1.4.4
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -741,8 +741,20 @@ client_sync() {
 }
 
 sync_timer_on() {
+    local m
     if [ "$(allowed_count)" = "0" ]; then
         warn "尚未授权任何用户，定时器开启后也不会有任何下发动作"
+    fi
+    info "当前间隔: $(sync_timer_interval)"
+    printf ' 请输入校验间隔（分钟，最小 5，直接回车用 10）: '
+    read -r m
+    case "$m" in
+        ""|0) m=10 ;;
+        *[!0-9]*) err "请输入数字"; return 1 ;;
+    esac
+    if [ "$m" -lt 5 ]; then
+        warn "不能低于 5 分钟，已按 5 分钟设置"
+        m=5
     fi
     cat > "$UNIT_DIR/mr-sync.service" <<EOF
 [Unit]
@@ -758,7 +770,7 @@ Description=每 10 分钟校验用户端 out
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=10min
+OnUnitActiveSec=${m}min
 AccuracySec=30s
 
 [Install]
@@ -766,7 +778,14 @@ WantedBy=timers.target
 EOF
     systemctl daemon-reload
     systemctl enable --now mr-sync.timer >/dev/null 2>&1
-    ok "自动校验定时器已启用（每 10 分钟）"
+    systemctl restart mr-sync.timer >/dev/null 2>&1 || true
+    ok "自动校验定时器已启用（每 $m 分钟）"
+}
+
+sync_timer_interval() {
+    local v
+    v="$(sed -n 's/^OnUnitActiveSec=//p' "$UNIT_DIR/mr-sync.timer" 2>/dev/null | head -1)"
+    [ -n "$v" ] && printf '每 %s' "$v" || printf '未设置'
 }
 
 sync_timer_off() {
@@ -1157,6 +1176,17 @@ uninstall_all() {
     info "删除单元文件与目录 ..."
     rm -f /etc/systemd/system/mr-*.service /etc/systemd/system/mr-*.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
+    printf ' 是否一并卸载依赖组件 wireguard-tools / sslocal? 输入 yes 卸载（其它保留）: '
+    read -r a3
+    if [ "$a3" = "yes" ]; then
+        if dpkg -s wireguard-tools >/dev/null 2>&1; then
+            apt-get remove -y wireguard-tools >/dev/null 2>&1 && info "已卸载 wireguard-tools" || warn "wireguard-tools 卸载失败"
+        fi
+        rm -f /usr/local/bin/sslocal && info "已删除 /usr/local/bin/sslocal"
+    else
+        info "已保留 wireguard-tools / sslocal（以后要用可直接复用）"
+    fi
+
     rm -rf "$CONF_DIR" "$DATA_DIR"
     rm -f /usr/local/bin/mr /usr/local/bin/mr-api.py
     # 一并清掉历次自更新留下的备份
@@ -1189,11 +1219,21 @@ doctor() {
     has_cmd sslocal; check_item "sslocal（ss-rust）" "$?" "ss/ss2022 出口依赖"
     has_cmd wg;     check_item "wireguard-tools" "$?" "wg 出口依赖"
     [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; check_item "ip_forward=1" "$?" "转发必需"
-    [ "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = "2" ]; check_item "rp_filter=2（loose）" "$?" "策略路由必需"
+    local rpv
+    rpv="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)"
+    if [ "$rpv" = "2" ]; then
+        check_item "rp_filter=2（loose）" 0 "策略路由已就绪"
+    else
+        printf '  %s[提示]%s %-26s 当前 %s；用 ss 出口不需要，用 wg 出口时建议设为 2\n' "$YELLOW" "$NC" "rp_filter" "${rpv:-未知}"
+    fi
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
-    systemctl is-active --quiet mr-sync.timer 2>/dev/null; check_item "自动校验定时器" "$?" "菜单 11 可开启"
+    if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
+        check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"
+    else
+        printf '  %s[提示]%s %-26s 未开启（可选功能，菜单 9 → 7 开启）\n' "$YELLOW" "$NC" "自动校验定时器"
+    fi
     local dup
     dup="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' 'NF>=7 && $7!="" {print $7}' | sort | uniq -d | tr '\n' ' ')"
     if [ -n "$dup" ]; then
@@ -1383,7 +1423,8 @@ exit_add() {
     mark="$(mark_next)"
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
     ok "已新增出口 $name（$proto / $method，mark $mark）"
-    info "记得回到主菜单 [10] 重新下发规则"
+    info "正在自动下发规则（ss 出口会立即启动 sslocal）..."
+    apply_all
     pause_back
 }
 
@@ -1699,7 +1740,7 @@ client_menu() {
         printf '    %s[4]%s 全部授权并下发（所有容器）\n' "$GREEN" "$NC"
         printf '    %s[5]%s 全部撤销授权并回收\n' "$GREEN" "$NC"
         printf '    %s[6]%s 校验并修复（仅已授权用户）\n' "$GREEN" "$NC"
-        printf '    %s[7]%s 开启自动校验（每 10 分钟）\n' "$GREEN" "$NC"
+        printf '    %s[7]%s 开启自动校验（自定义间隔，最小 5 分钟）\n' "$GREEN" "$NC"
         printf '    %s[8]%s 关闭自动校验\n' "$GREEN" "$NC"
         printf '    %s[9]%s 更新基准脚本（从指定路径）\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回上一层\n' "$GREEN" "$NC"
