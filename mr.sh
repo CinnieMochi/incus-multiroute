@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.3.3
+# Incus MultiRoute 宿主机出口管理脚本 v1.3.4
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1084,10 +1084,16 @@ uninstall_all() {
     info "停止并清理服务单元 ..."
     systemctl disable --now mr-sync.timer  >/dev/null 2>&1 || true
     systemctl disable --now mr-api.service >/dev/null 2>&1 || true
-    while IFS='|' read -r name proto l; do
-        case "$name" in ''|'#'*) continue ;; esac
-        systemctl disable --now "mr-ss-$name.service" >/dev/null 2>&1 || true
+    # 单元是按 mark 命名的（中文名不能做 systemd 单元名），这里必须用 mark
+    while IFS= read -r l; do
+        case "$l" in ''|'#'*) continue ;; esac
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable <<< "$l"
+        case "$proto" in
+            ss|ss2022) systemctl disable --now "mr-ss-$mark.service" >/dev/null 2>&1 || true ;;
+        esac
     done < "$EXITS_CONF" 2>/dev/null
+    # 兜底：清掉任何残留的 mr-ss-* 单元
+    systemctl disable --now 'mr-ss-*' >/dev/null 2>&1 || true
 
     info "清理 wg 接口与策略路由 ..."
     while IFS= read -r l; do
