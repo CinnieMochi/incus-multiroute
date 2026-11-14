@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.14
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.15
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.14"
+SCRIPT_VERSION="1.2.15"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1115,6 +1115,8 @@ uninstall_all() {
     systemctl daemon-reload >/dev/null 2>&1 || true
     rm -rf "$CONF_DIR" "$DATA_DIR"
     rm -f /usr/local/bin/mr /usr/local/bin/mr-api.py
+    # 一并清掉历次自更新留下的备份
+    rm -f /usr/local/bin/mr.bak.* /usr/local/bin/mr-api.py.bak.* 2>/dev/null || true
     subline
     ok "卸载完成（wireguard-tools / sslocal / incus 均未改动）"
     printf '\n'
