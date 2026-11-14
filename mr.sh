@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# IncuShlii Egress 宿主机出口管理脚本 v1.1.0
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
-# 风格：与 lxc.sh（Shlii-Incus 容器管理）保持一致
+# 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
 # 目录：
 #   /etc/incus-multiroute        配置（出口、绑定、令牌、用户端脚本基准）

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Shlii-Egress 用户端 API
+Incus MultiRoute 用户端 API
 供容器内的 out 客户端调用，只做三件事：报状态、改绑定、触发下发。
 鉴权：请求源 IP 必须对应某个已绑定的容器，且 X-Egress-Token 与该容器的令牌一致。
 """
