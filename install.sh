@@ -34,9 +34,20 @@ for p in curl python3 nftables iproute2 jq ca-certificates; do
     fi
 done
 
-info "下载最新源码 ..."
+info "准备安装文件 ..."
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# 本地离线安装：若 install.sh 同目录已有 mr.sh，直接用它（离线/内网环境）
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SELF_DIR/mr.sh" ] && [ -f "$SELF_DIR/mr-api.py" ]; then
+    cp -f "$SELF_DIR/mr.sh"     "$TMP/mr.sh"
+    cp -f "$SELF_DIR/mr-api.py" "$TMP/mr-api.py"
+    [ -f "$SELF_DIR/version.txt" ] && cp -f "$SELF_DIR/version.txt" "$TMP/version.txt"
+    info "检测到本地源码，使用离线安装模式"
+fi
+if [ ! -f "$TMP/mr.sh" ]; then
+info "下载最新源码 ..."
 
 # 优先用 commit SHA 拉 codeload（分支名 tarball 也会被 CDN 缓存）
 SHA="$(curl -s --max-time 20 "https://api.github.com/repos/$REPO/git/refs/heads/$BRANCH" 2>/dev/null \
@@ -59,6 +70,7 @@ if [ ! -f "$TMP/mr.sh" ]; then
     curl -fsSL -H 'Cache-Control: no-cache' --max-time 60 -o "$TMP/mr.sh"     "$RAW/mr.sh"     || { err "下载 mr.sh 失败"; exit 1; }
     curl -fsSL -H 'Cache-Control: no-cache' --max-time 60 -o "$TMP/mr-api.py" "$RAW/mr-api.py" || { err "下载 mr-api.py 失败"; exit 1; }
     curl -fsSL -H 'Cache-Control: no-cache' --max-time 30 -o "$TMP/version.txt" "$RAW/version.txt" 2>/dev/null || true
+fi
 fi
 
 [ -f /usr/local/bin/mr ] && cp -f /usr/local/bin/mr "/usr/local/bin/mr.bak.$(date +%Y%m%d%H%M%S)" && warn "已备份旧版本"
