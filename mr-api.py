@@ -349,8 +349,21 @@ def listen_addr():
                 if m:
                     return m.group(1)
     except FileNotFoundError:
-        # 没有 api.conf 时退回监听全部地址，并在日志里明确提示
-        print("WARN: %s 不存在，API 将监听 0.0.0.0:18988（建议只绑定网桥地址）"
+        # 没有 api.conf 时优先绑定网桥网关；拿不到才退回全部地址（并明确警告）
+        gw = ""
+        try:
+            with open(os.path.join(CONF_DIR, "mr.conf"), "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'\s*SUBNET_GW\s*=\s*"?([0-9.]+)"?', line)
+                    if m:
+                        gw = m.group(1)
+                        break
+        except OSError:
+            gw = ""
+        if gw:
+            print("WARN: %s 不存在，API 绑定网桥地址 %s:18988" % (API_CONF, gw), flush=True)
+            return "%s:18988" % gw
+        print("WARN: %s 不存在且取不到网桥地址，API 将监听 0.0.0.0:18988（有暴露风险）"
               % API_CONF, flush=True)
         return "0.0.0.0:18988"
 

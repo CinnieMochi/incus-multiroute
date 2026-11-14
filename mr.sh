@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.4.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.4.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.4.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -716,7 +716,7 @@ client_inject_api_url() {
 
 client_hash_in() {
     local name="$1"
-    incus exec "$name" -- sh -c 'sha256sum /usr/local/bin/out 2>/dev/null | cut -d" " -f1' 2>/dev/null | tr -d '\r' | head -1
+    incus exec "$name" -- sh -c 'sha256sum /usr/local/bin/out 2>/dev/null | cut -d" " -f1' </dev/null 2>/dev/null | tr -d '\r' | head -1
 }
 
 token_of() {
@@ -771,7 +771,7 @@ client_revoke() {
         grep -vx "$name" "$CLIENT_ALLOW_CONF" > "$CLIENT_ALLOW_CONF.tmp" 2>/dev/null || :
         mv -f "$CLIENT_ALLOW_CONF.tmp" "$CLIENT_ALLOW_CONF"
     fi
-    incus exec "$name" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' >/dev/null 2>&1 || true
+    incus exec "$name" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' </dev/null >/dev/null 2>&1 || true
     bind_remove "$name" >/dev/null 2>&1 || true
     ok "$name 已撤销授权，容器内 out 与令牌已移除，绑定已清除"
     pause_back
@@ -823,7 +823,7 @@ client_revoke_all() {
         *) info "已取消，未做任何改动"; pause_back; return 0 ;;
     esac
     for c in $list; do
-        incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' >/dev/null 2>&1 && cnt=$((cnt + 1))
+        incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' </dev/null >/dev/null 2>&1 && cnt=$((cnt + 1))
         bind_remove "$c" >/dev/null 2>&1 || true
     done
     printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
@@ -870,6 +870,7 @@ client_status() {
         fi
     done
     subline
+    info "共 $(containers_scan 2>/dev/null | wc -l | tr -d ' ') 个容器，其中 $(allowed_count) 个已授权"
 }
 
 client_sync() {
@@ -887,18 +888,32 @@ client_sync() {
         pause_back
         return 0
     fi
-    local c
+    local c failed="" gone=""
+    local existing
+    existing="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"' | tr '\n' ' ')"
     for c in $(allowed_list); do
+        case " $existing " in
+            *" $c "*) ;;
+            *) gone="$gone $c"; continue ;;
+        esac
         h="$(client_hash_in "$c")"
         if [ "$h" != "$base" ]; then
-            client_push_one "$c" >/dev/null 2>&1 && pushed=$((pushed + 1))
+            if client_push_one "$c" >/dev/null 2>&1; then
+                pushed=$((pushed + 1))
+            else
+                failed="$failed $c"
+            fi
         fi
     done
     if [ -n "$quiet" ]; then
-        [ "$pushed" -gt 0 ] && echo "$(date '+%F %T') 已同步 $pushed/$tot 个已授权容器" >> "$DATA_DIR/sync.log"
+        if [ "$pushed" -gt 0 ] || [ -n "$failed" ]; then
+            echo "$(date '+%F %T') 已同步 $pushed/$tot 个已授权容器${failed:+；失败:$failed}" >> "$DATA_DIR/sync.log"
+        fi
     else
         title "下发用户端 out"
         ok "已授权 $tot 个容器，本次推送 $pushed 个"
+        [ -n "$failed" ] && warn "推送失败:$failed（容器可能已停）"
+        [ -n "$gone" ] && warn "授权表里有已不存在的容器:$gone（可用 [3] 撤销）"
         pause_back
     fi
 }
@@ -1325,7 +1340,7 @@ uninstall_all() {
     info "回收所有已授权容器的 out ..."
     local c
     for c in $(allowed_list); do
-        incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' >/dev/null 2>&1 \
+        incus exec "$c" -- sh -c 'rm -f /usr/local/bin/out /etc/incus-egress-token' </dev/null >/dev/null 2>&1 \
             && info "已回收 $c" || warn "$c 回收失败（容器可能已停）"
     done
 
@@ -1396,7 +1411,7 @@ sec_status_table() {
     printf '  %-22s %-16s %-16s
 ' "容器" "IPv4 防伪" "IPv6 防伪"
     subline
-    for c in $(incus list --format=csv -c n 2>/dev/null | tail -n +2); do
+    for c in $(incus list --format=csv -c n 2>/dev/null); do
         dev="$(container_nic_dev "$c")"
         v4="$(sec_flag "$c" "$dev" ipv4_filtering)"
         v6="$(sec_flag "$c" "$dev" ipv6_filtering)"
@@ -1420,7 +1435,7 @@ sec_apply_all() {
     if ! host_has_ipv6; then info "宿主机没有 IPv6 默认路由，跳过 ipv6_filtering"; fi
     if ! host_has_ipv4; then info "宿主机没有 IPv4 默认路由，跳过 ipv4_filtering"; fi
     subline
-    for c in $(incus list --format=csv -c n 2>/dev/null | tail -n +2); do
+    for c in $(incus list --format=csv -c n 2>/dev/null); do
         n=$((n + 1))
         if sec_apply_one "$c" "$mode"; then
             ok=$((ok + 1))
@@ -1464,7 +1479,7 @@ sec_menu() {
             0|"") return 0 ;;
             1) title "加固状态"; sec_status_table; pause_back ;;
             2)
-                printf ' 确认给 %s 个容器开启防伪? 输入 yes 继续: ' "$(incus list --format=csv -c n 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+                printf ' 确认给 %s 个容器开启防伪? 输入 yes 继续: ' "$(incus list --format=csv -c n 2>/dev/null | grep -c .)"
                 read -r a
                 [ "$a" = "yes" ] || { info "已取消"; pause_back; continue; }
                 sec_apply_all 1; pause_back
@@ -1516,6 +1531,17 @@ doctor() {
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
     [ -n "$(client_hash_base 2>/dev/null)" ]; check_item "基准哈希" "$?" "$CLIENT_HASH"
+    local api_listen
+    api_listen="$(ss -lntH 2>/dev/null | awk '$4 ~ /:18988$/ {print $4; exit}')"
+    if [ -n "$api_listen" ]; then
+        case "$api_listen" in
+            0.0.0.0:*|"*":*|"[::]"*)
+                printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "API 监听全部地址" "$api_listen"
+                info "建议只绑网桥地址：写 LISTEN=\"<网桥IP>:18988\" 到 $CONF_DIR/api.conf 后重启 mr-api"
+                ;;
+            *) check_item "API 监听地址" 0 "$api_listen" ;;
+        esac
+    fi
     local pc
     pc="$(tproxy_port_conflicts 2>/dev/null)"
     if [ -n "$pc" ]; then
