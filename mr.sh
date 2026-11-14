@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v1.2.4
+# Incus MultiRoute 宿主机出口管理脚本 v1.2.5
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -309,11 +309,12 @@ gen_nft() {
     {
         echo "# 由 Incus MultiRoute 生成于 $ts —— 请勿手改"
         echo 'table inet multiroute {'
-        echo '    set bypass4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } }'
+        # nft 1.0.x 要求 set/map 的右花括号在新行（同一行会报 unexpected '}'）
+        printf '    set bypass4 {\n        type ipv4_addr\n        flags interval\n        elements = { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 }\n    }\n'
         if [ -n "$elems" ]; then
-            echo "    map c_ip { type ipv4_addr : mark; elements = {$elems } }"
+            printf '    map c_ip {\n        type ipv4_addr : mark\n        elements = {%s\n        }\n    }\n' "$elems"
         else
-            echo '    map c_ip { type ipv4_addr : mark }'
+            printf '    map c_ip {\n        type ipv4_addr : mark\n    }\n'
         fi
         echo '    chain prerouting {'
         echo '        type filter hook prerouting priority -160; policy accept;'
