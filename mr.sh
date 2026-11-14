@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.3.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.3.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,7 +39,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1732,6 +1732,35 @@ exit_add() {
     case "$expect" in 0) info "已取消"; return 0 ;; esac
     [ -n "$expect" ] || expect="$host"
     mark="$(mark_next)"
+    # ss 出口会独占一个本地代理端口，先确认这个端口没被别人占着
+    case "$proto" in
+        ss|ss2022)
+            local cand owner nb ssn
+            ssn="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' '$2=="ss"||$2=="ss2022"{n++} END{print n+0}')"
+            cand=$((TPROXY_BASE + ssn + 1))
+            while :; do
+                if [ "$cand" -gt "$((TPROXY_BASE + 99))" ]; then
+                    err "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 已用尽"
+                    info "请增大 TPROXY_BASE（如 28000）后重试"
+                    pause_back; return 1
+                fi
+                owner="$(port_owner "$cand" 2>/dev/null)"
+                case "$owner" in
+                    *sing-box*) ;;
+                    "") break ;;
+                esac
+                warn "端口 $cand 已被占用（$owner）"
+                info "继续新增会导致这个出口起不来。可以换一个端口段基数（如 28000），或回车取消"
+                printf ' 新端口段基数: '; read -r nb
+                case "$nb" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
+                case "$nb" in *[!0-9]*) err "请输入数字"; pause_back; return 1 ;; esac
+                TPROXY_BASE="$nb"
+                save_main_var TPROXY_BASE "$TPROXY_BASE"
+                info "端口段已改为 $TPROXY_BASE-$((TPROXY_BASE + 99))"
+                cand=$((TPROXY_BASE + ssn + 1))
+            done
+            ;;
+    esac
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" >> "$EXITS_CONF"
     ok "已新增出口 $name（$proto / $method，mark $mark）"
     info "正在自动下发规则（ss 出口会立即启动 sing-box）..."
