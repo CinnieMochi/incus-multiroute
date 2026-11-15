@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.3.1
+# Incus MultiRoute 宿主机出口管理脚本 v3.3.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -43,7 +43,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.3.1"
+SCRIPT_VERSION="3.3.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -554,7 +554,7 @@ exit_add_logic() {
         pause_back; return 1
     fi
     while :; do
-        printf '节点名称（输入 0 返回菜单）: '; read -r name
+        printf '节点名称（输入 0 返回菜单）: '; read -r name || return 0
         case "$name" in 0|"") info "已取消"; return 0 ;; esac
         [ -n "$name" ] || { err "名称不能为空"; continue; }
         if exit_exists "$name"; then err "出口已存在: $name"; continue; fi
@@ -609,20 +609,20 @@ exit_add_logic() {
                     st="host"
                     ;;
                 host)
-                    printf '服务器地址（0=返回上一步）: '; read -r host
+                    printf '服务器地址（0=返回上一步）: '; read -r host || return 0
                     [ "$host" = "0" ] && { st="method"; continue; }
                     [ -n "$host" ] || { err "地址不能为空"; continue; }
                     st="port"
                     ;;
                 port)
-                    printf '端口（0=返回上一步）: '; read -r port
+                    printf '端口（0=返回上一步）: '; read -r port || return 0
                     [ "$port" = "0" ] && { st="host"; continue; }
                     case "$port" in ''|*[!0-9]*) err "端口必须是数字"; continue ;; esac
                     if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then err "端口范围 1-65535"; continue; fi
                     st="pass"
                     ;;
                 pass)
-                    printf '密码（0=返回上一步）: '; read -r pass
+                    printf '密码（0=返回上一步）: '; read -r pass || return 0
                     [ "$pass" = "0" ] && { st="port"; continue; }
                     [ -n "$pass" ] || { err "密码不能为空"; continue; }
                     if [ "$step" = "ss2022" ]; then
@@ -644,7 +644,7 @@ exit_add_logic() {
                         printf '  %s[1]%s IPv4\n' "$GREEN" "$NC"
                         printf '  %s[2]%s IPv6\n' "$GREEN" "$NC"
                         printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
-                        printf '请输入 [0-2]: '; read -r fs
+                        printf '请输入 [0-2]: '; read -r fs || return 0
                         case "$fs" in
                             0) st="pass"; continue ;;
                             2) fam="v6" ;;
@@ -665,12 +665,12 @@ exit_add_logic() {
         if [ "$used4" = "1" ] && [ "$used6" = "1" ]; then
             info "IPv4 与 IPv6 成员都已就绪"; break
         fi
-        printf '继续添加另一个家族的成员? [Y/n]: '; read -r a
+        printf '继续添加另一个家族的成员? [Y/n]: '; read -r a || return 0
         case "$a" in [nN]) break ;; esac
     done
 
     while :; do
-        printf '期望出口 IP（可留空；输入 0 删除整个节点）: '; read -r expect
+        printf '期望出口 IP（可留空；输入 0 删除整个节点）: '; read -r expect || return 0
         [ "$expect" = "0" ] && { logic_del_node "$name"; info "已取消"; return 0; }
         break
     done
@@ -2185,7 +2185,7 @@ exit_edit() {
     title "修改出口节点"
     exits_print_numbered
     subline
-    printf '输入要修改的出口编号（0 返回）: '; read -r num
+    printf '输入要修改的出口编号（0 返回）: '; read -r num || return 0
     case "$num" in 0|"") return 0 ;; esac
     case "$num" in *[!0-9]*) err "请输入编号"; pause_back; return 1 ;; esac
     name="$(exits_list_plain | sed -n "${num}p" | cut -d'|' -f1)"
@@ -2216,11 +2216,11 @@ exit_edit() {
         printf '    %s[7]%s 启用 / 停用\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
-        printf '请输入选项: '; read -r msel
+        printf '请输入选项: '; read -r msel || return 0
         case "$msel" in
             0|"") return 0 ;;
             1)
-                printf '新名称（0 返回）: '; read -r val
+                printf '新名称（0 返回）: '; read -r val || return 0
                 case "$val" in 0|"") continue ;; esac
                 exit_exists "$val" && [ "$val" != "$name" ] && { err "已有同名出口"; continue; }
                 edit_exit_field "$name" 1 "$val" || continue
@@ -2237,7 +2237,7 @@ exit_edit() {
                 ;;
             2)
                 if [ "$proto" = "logic" ]; then exit_edit_members "$name"; continue; fi
-                printf '新服务器地址（0 返回）: '; read -r val
+                printf '新服务器地址（0 返回）: '; read -r val || return 0
                 case "$val" in 0|"") continue ;; esac
                 case "$val" in \[*\]) val="$(printf '%s' "$val" | tr -d '[]')" ;; esac
                 edit_exit_field "$name" 3 "$val" || continue
@@ -2245,7 +2245,7 @@ exit_edit() {
                 ;;
             3)
                 [ "$proto" = "logic" ] && { echo "无效选择"; sleep 1; continue; }
-                printf '新端口（0 返回）: '; read -r val
+                printf '新端口（0 返回）: '; read -r val || return 0
                 case "$val" in 0|"") continue ;; esac
                 case "$val" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
                 edit_exit_field "$name" 4 "$val" || continue
@@ -2262,7 +2262,7 @@ exit_edit() {
                 fi
                 i=1; for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
                 printf '  %s[0]%s 返回\n' "$YELLOW" "$NC"
-                printf '请选择 [0-%s]: ' "$((i - 1))"; read -r msel
+                printf '请选择 [0-%s]: ' "$((i - 1))"; read -r msel || return 0
                 case "$msel" in 0|"") continue ;; esac
                 case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
                 val="$(printf '%s\n' $methods | sed -n "${msel}p")"
@@ -2274,7 +2274,7 @@ exit_edit() {
             5)
                 [ "$proto" = "logic" ] && { echo "无效选择"; sleep 1; continue; }
                 while :; do
-                    printf '新密码（0 返回）: '; read -r val
+                    printf '新密码（0 返回）: '; read -r val || return 0
                     case "$val" in 0|"") break ;; esac
                     if [ "$proto" = "ss2022" ]; then
                         if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
@@ -2286,7 +2286,7 @@ exit_edit() {
                 done
                 ;;
             6)
-                printf '新期望出口 IP（留空=用服务器地址，0 返回）: '; read -r val
+                printf '新期望出口 IP（留空=用服务器地址，0 返回）: '; read -r val || return 0
                 case "$val" in 0) continue ;; esac
                 [ -n "$val" ] || val="$host"
                 edit_exit_field "$name" 11 "$val" || continue
@@ -2372,7 +2372,7 @@ exit_edit_members() {  # $1=节点名
             printf '  %-4s %-18s %-6s %-6s %-22s\n' "$a2" "$(proto_label "$a3")" "$a8" "${a9:-auto}" "$([ "$a3" = direct ] && echo 本机直出 || echo "${a4:-—}:${a5:-—}")"
         done < "$LOGIC_CONF"
         subline
-        printf '输入成员序号修改（0 返回）: '; read -r num
+        printf '输入成员序号修改（0 返回）: '; read -r num || return 0
         case "$num" in 0|"") return 0 ;; esac
         midx="$num"
         local ml
@@ -2390,13 +2390,13 @@ exit_edit_members() {  # $1=节点名
         printf '    %s[5]%s 出站家族（当前 %s）\n' "$GREEN" "$NC" "$fam"
         printf '    %s[6]%s 接入家族（当前 %s）\n' "$GREEN" "$NC" "${tp:-auto}"
         printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
-        printf '请选择: '; read -r msel
+        printf '请选择: '; read -r msel || return 0
         case "$msel" in
             0|"") continue ;;
-            1) printf '新地址（0 返回）: '; read -r val
+            1) printf '新地址（0 返回）: '; read -r val || return 0
                case "$val" in 0|"") continue ;; esac
                edit_logic_member_field "$node" "$midx" 4 "$val" ;;
-            2) printf '新端口（0 返回）: '; read -r val
+            2) printf '新端口（0 返回）: '; read -r val || return 0
                case "$val" in 0|"") continue ;; esac
                case "$val" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
                edit_logic_member_field "$node" "$midx" 5 "$val" ;;
@@ -2406,12 +2406,12 @@ exit_edit_members() {  # $1=节点名
                    methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
                fi
                i=1; for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
-               printf '请选择 [1-%s]: ' "$((i - 1))"; read -r msel
+               printf '请选择 [1-%s]: ' "$((i - 1))"; read -r msel || return 0
                val="$(printf '%s\n' $methods | sed -n "${msel}p")"
                [ -n "$val" ] || { err "无效选择"; continue; }
                edit_logic_member_field "$node" "$midx" 6 "$val" ;;
             4) while :; do
-                   printf '新密码（0 返回）: '; read -r val
+                   printf '新密码（0 返回）: '; read -r val || return 0
                    case "$val" in 0|"") break ;; esac
                    if [ "$proto" = "ss2022" ]; then
                        if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
@@ -2420,10 +2420,10 @@ exit_edit_members() {  # $1=节点名
                    fi
                    edit_logic_member_field "$node" "$midx" 7 "$val"; break
                done ;;
-            5) printf '出站家族 [1] IPv4 [2] IPv6（0 返回）: '; read -r val
+            5) printf '出站家族 [1] IPv4 [2] IPv6（0 返回）: '; read -r val || return 0
                case "$val" in 0|"") continue ;; 2) val="v6" ;; 1) val="v4" ;; *) continue ;; esac
                edit_logic_member_field "$node" "$midx" 8 "$val" ;;
-            6) printf '接入家族 [1] IPv4 [2] IPv6 [3] 与出站相同（0 返回）: '; read -r val
+            6) printf '接入家族 [1] IPv4 [2] IPv6 [3] 与出站相同（0 返回）: '; read -r val || return 0
                case "$val" in 0|"") continue ;; 1) val="v4" ;; 2) val="v6" ;; 3) val="auto" ;; *) continue ;; esac
                edit_logic_member_field "$node" "$midx" 9 "$val" ;;
             *) echo "无效选择"; sleep 1; continue ;;
@@ -2486,7 +2486,7 @@ exit_add_extend() {
         info "本机只有 IPv6：IPv6 走本机直出，需要远端节点补 IPv4 出站"
     fi
     subline
-    printf '节点名称（如 双栈-拓展，输入 0 取消）: '; read -r name
+    printf '节点名称（如 双栈-拓展，输入 0 取消）: '; read -r name || return 0
     case "$name" in 0|"") info "已取消"; return 0 ;; esac
     exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
     while :; do
@@ -2498,7 +2498,7 @@ exit_add_extend() {
         read -r msel || return 0
         case "$msel" in
             0) info "已返回节点名称输入"
-               printf '节点名称: '; read -r name
+               printf '节点名称: '; read -r name || return 0
                case "$name" in 0|"") info "已取消"; return 0 ;; esac
                continue ;;
             2) proto="ss" ;;
@@ -2519,13 +2519,21 @@ exit_add_extend() {
         case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
         method="$(printf '%s\n' $methods | sed -n "${msel}p")"
         [ -n "$method" ] || { err "无效选择"; continue; }
-        printf '服务器地址（输入 0 返回上一步）: '; read -r host
+        printf '服务器地址（输入 0 返回上一步）: '; read -r host || return 0
         case "$host" in 0|"") continue ;; esac
-        printf '端口（输入 0 返回上一步）: '; read -r port
+        # 隧道走的是“本机能出网”的那个家族，域名必须能解析出该家族的记录
+        if [ "$localfam" = "v4" ]; then
+            getent ahostsv4 "$host" >/dev/null 2>&1 \
+                || warn "$host 没有 IPv4（A 记录）：本机只有 IPv4，隧道可能连不上"
+        else
+            getent ahostsv6 "$host" >/dev/null 2>&1 \
+                || warn "$host 没有 IPv6（AAAA 记录）：本机只有 IPv6，隧道可能连不上"
+        fi
+        printf '端口（输入 0 返回上一步）: '; read -r port || return 0
         case "$port" in 0|"") continue ;; esac
         case "$port" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
         while :; do
-            printf '密码（输入 0 返回上一步）: '; read -r pass
+            printf '密码（输入 0 返回上一步）: '; read -r pass || return 0
             case "$pass" in 0|"") break ;; esac
             if [ "$proto" = "ss2022" ]; then
                 if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
@@ -2537,7 +2545,7 @@ exit_add_extend() {
         [ -n "$pass" ] || continue
         break
     done
-    printf '期望出口 IP（可留空，输入 0 取消整个节点）: '; read -r expect
+    printf '期望出口 IP（可留空，输入 0 取消整个节点）: '; read -r expect || return 0
     case "$expect" in 0) info "已取消"; return 0 ;; esac
     mark="$(mark_next)"
     # 成员 1：本机直出（占 localfam 槽）；成员 2：远端节点（占 remfam 槽，走 localfam 接入）
@@ -2588,13 +2596,13 @@ exit_add() {
             step="name"
             ;;
         name)
-            printf '名称（如 香港-01，输入 0 返回上一步）: '; read -r name
+            printf '名称（如 香港-01，输入 0 返回上一步）: '; read -r name || return 0
             case "$name" in 0|"") info "已返回协议选择"; step="proto"; continue ;; esac
             exit_exists "$name" && { err "出口已存在: $name"; continue; }
             step="host"
             ;;
         host)
-            printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回上一步）: '; read -r host
+            printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回上一步）: '; read -r host || return 0
             case "$host" in 0|"") info "已返回名称输入"; step="name"; continue ;; esac
             case "$host" in \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;; esac
             case "$host" in
@@ -2630,7 +2638,7 @@ exit_add() {
             if [ "$proto" = "wg" ]; then step="wgkey"; else step="password"; fi
             ;;
         password)
-            printf '密码（输入 0 返回上一步）: '; read -r pass
+            printf '密码（输入 0 返回上一步）: '; read -r pass || return 0
             case "$pass" in 0|"") info "已返回端口输入"; step="port"; continue ;; esac
             if [ "$proto" = "ss2022" ]; then
                 if reason="$(ss2022_pass_check "$method" "$pass")"; then :; else
@@ -2645,31 +2653,31 @@ exit_add() {
             step="expect"
             ;;
         wgport)
-            printf '端口 [51820]（输入 0 返回上一步）: '; read -r port
+            printf '端口 [51820]（输入 0 返回上一步）: '; read -r port || return 0
             case "$port" in 0|"") info "已返回服务器地址"; step="host"; continue ;; esac
             [ -n "$port" ] || port=51820
             step="wgkey"
             ;;
         wgkey)
             ensure_wg_key || { pause_back; return 1; }
-            printf '出口机公钥（输入 0 返回上一步）: '; read -r wgkey
+            printf '出口机公钥（输入 0 返回上一步）: '; read -r wgkey || return 0
             case "$wgkey" in 0|"") info "已返回端口输入"; step="wgport"; continue ;; esac
             step="wgif"
             ;;
         wgif)
-            printf '本机接口名 [wg-exitN]（输入 0 返回上一步）: '; read -r wgif
+            printf '本机接口名 [wg-exitN]（输入 0 返回上一步）: '; read -r wgif || return 0
             case "$wgif" in 0|"") info "已返回出口机公钥"; step="wgkey"; continue ;; esac
             [ -n "$wgif" ] || wgif="wg-exit$(($(exits_count) + 1))"
             step="wglocal"
             ;;
         wglocal)
-            printf '本机隧道地址（如 10.200.1.2/32，输入 0 返回上一步）: '; read -r local
+            printf '本机隧道地址（如 10.200.1.2/32，输入 0 返回上一步）: '; read -r local || return 0
             case "$local" in 0|"") info "已返回接口名"; step="wgif"; continue ;; esac
             method=""; pass=""
             step="expect"
             ;;
         expect)
-            printf '期望出口 IP（留空=服务器地址，输入 0 返回上一步）: '; read -r expect
+            printf '期望出口 IP（留空=服务器地址，输入 0 返回上一步）: '; read -r expect || return 0
             case "$expect" in 0) info "已返回上一步"; step=$([ "$proto" = "wg" ] && echo wglocal || echo password); continue ;; esac
             [ -n "$expect" ] || expect="$host"
             mark="$(mark_next)"
@@ -2685,7 +2693,7 @@ exit_add() {
                             warn "默认端口 $cand 已被占用（$owner）"
                             info "老出口不受影响，只给这个新出口指定一个本地端口"
                             while :; do
-                                printf ' 新出口本地端口（留空取消）: '; read -r np
+                                printf ' 新出口本地端口（留空取消）: '; read -r np || return 0
                                 case "$np" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
                                 case "$np" in *[!0-9]*) err "请输入数字"; continue ;; esac
                                 if [ "$np" -lt 1024 ] || [ "$np" -gt 65535 ]; then err "端口范围 1024-65535"; continue; fi
@@ -2942,7 +2950,7 @@ bind_menu_choose() {
     subline
     containers_print_numbered "$cf"
     subline
-    printf ' 输入容器编号（0 返回）: '; read -r n
+    printf ' 输入容器编号（0 返回）: '; read -r n || return 0
     case "$n" in 0|"") rm -f "$cf"; info "已取消"; return 1 ;; esac
     case "$n" in *[!0-9]*) rm -f "$cf"; err "请输入编号"; pause_back; return 1 ;; esac
     name="$(sed -n "${n}p" "$cf")"
@@ -2956,7 +2964,7 @@ bind_menu_choose() {
     exits_print_numbered "$ef"
     subline
     printf '  输入出口编号；输入 0 = 入口机直出；直接回车 = 取消\n'
-    printf '请输入: '; read -r e
+    printf '请输入: '; read -r e || return 0
     case "$e" in "") rm -f "$ef"; info "已取消"; return 1 ;; esac
     case "$e" in *[!0-9]*) rm -f "$ef"; err "请输入编号"; pause_back; return 1 ;; esac
     if [ "$e" = "0" ]; then
@@ -2982,7 +2990,7 @@ bind_menu_remove() {
     subline
     containers_print_numbered "$f"
     subline
-    printf ' 输入容器编号（0 返回）: '; read -r n
+    printf ' 输入容器编号（0 返回）: '; read -r n || return 0
     case "$n" in 0|"") rm -f "$f"; info "已取消"; return 0 ;; esac
     case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; pause_back; return 1 ;; esac
     name="$(sed -n "${n}p" "$f")"
