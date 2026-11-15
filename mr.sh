@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.1
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -44,7 +44,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.1"
+SCRIPT_VERSION="3.4.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -853,6 +853,19 @@ proto_label() {
     esac
 }
 
+conf_backup() {
+    # 每次下发前留一份配置快照，出问题能回滚（只保留最近 10 份）
+    local d f
+    d="$DATA_DIR/backup/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$d" 2>/dev/null || return 0
+    for f in "$EXITS_CONF" "$BIND_CONF" "$CLIENT_ALLOW_CONF" "$CLIENT_DENY_CONF" "$LOGIC_CONF" "$MAIN_CONF"; do
+        [ -f "$f" ] && cp -f "$f" "$d/" 2>/dev/null
+    done
+    chmod 600 "$d"/* 2>/dev/null || true
+    ls -1dt "$DATA_DIR/backup"/* 2>/dev/null | tail -n +11 | while IFS= read -r x; do rm -rf "$x"; done
+    return 0
+}
+
 json_esc() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -1101,6 +1114,7 @@ apply_all() {
     local force="${1:-0}"
     load_conf
     require_root
+    conf_backup
     title "下发规则"
     apply_nft_only || { err "nft 下发失败"; pause_back; return 1; }
     ok "nft 规则已加载"
@@ -1855,6 +1869,13 @@ uninstall_all() {
         info "已保留 wireguard-tools / sing-box（以后要用可直接复用）"
     fi
 
+    local _bk
+    _bk="/root/incus-multiroute-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if tar czf "$_bk" -C / etc/incus-multiroute 2>/dev/null; then
+        ok "配置已备份：$_bk"
+    else
+        warn "配置备份失败（继续卸载）"
+    fi
     rm -rf "$CONF_DIR" "$DATA_DIR"
     rm -f /usr/local/bin/mr /usr/local/bin/mr-api.py
     # 一并清掉历次自更新留下的备份
@@ -3007,8 +3028,27 @@ containers_list() {
     pause_back
 }
 
+sel_parse_multi() {  # $1=输入 $2=上限 $3=允许 all(默认1) → 输出 "编号 编号" 或 "ALL"
+    local in max tok out="" n
+    in="${1//,/ }"; max="$2"
+    [ -n "$in" ] || return 1
+    for tok in $in; do
+        case "$tok" in
+            all|ALL|All|a|A|全选|全部)
+                [ "${3:-1}" = "1" ] && { printf 'ALL'; return 0; }
+                return 1 ;;
+        esac
+        case "$tok" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$tok" -ge 1 ] 2>/dev/null && [ "$tok" -le "$max" ] || return 1
+        case " $out " in *" $tok "*) continue ;; esac
+        out="$out $tok"
+    done
+    [ -n "$out" ] || return 1
+    printf '%s' "${out# }"
+}
+
 bind_menu_choose() {
-    local cf ef n e name exit_name
+    local cf ef n e name exit_name sel picks k cnt failed
     clear_if_tty
     title "绑定容器到出口"
     cf="$(mktemp)"
@@ -3016,12 +3056,22 @@ bind_menu_choose() {
     subline
     containers_print_numbered "$cf"
     subline
+    printf ' 支持多选：空格分隔，如 %s1 2 8%s；%sall%s = 全部容器\n' "$YELLOW" "$NC" "$YELLOW" "$NC"
     printf ' 输入容器编号（0 返回）: '; read -r n || return 0
     case "$n" in 0|"") rm -f "$cf"; info "已取消"; return 1 ;; esac
-    case "$n" in *[!0-9]*) rm -f "$cf"; err "请输入编号"; pause_back; return 1 ;; esac
-    name="$(sed -n "${n}p" "$cf")"
+    sel="$(sel_parse_multi "$n" "$(grep -c . "$cf")")" || {
+        rm -f "$cf"; err "编号无效：$n（示例：1 2 8 或 all）"; pause_back; return 1
+    }
+    picks=""
+    if [ "$sel" = "ALL" ]; then
+        picks="$(cat "$cf")"
+    else
+        for k in $sel; do picks="$picks$(sed -n "${k}p" "$cf")"$'\n'; done
+    fi
     rm -f "$cf"
-    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    picks="$(printf '%s' "$picks" | sed '/^$/d')"
+    [ -n "$picks" ] || { err "没有可用容器"; pause_back; return 1; }
+    ok "本次操作 $(printf '%s\n' "$picks" | grep -c .) 个容器"
 
     clear_if_tty
     ef="$(mktemp)"
@@ -3033,14 +3083,28 @@ bind_menu_choose() {
     printf '请输入: '; read -r e || return 0
     case "$e" in "") rm -f "$ef"; info "已取消"; return 1 ;; esac
     case "$e" in *[!0-9]*) rm -f "$ef"; err "请输入编号"; pause_back; return 1 ;; esac
+    local cnt=0 failed=0
     if [ "$e" = "0" ]; then
         rm -f "$ef"
-        bind_clear "$name"
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            bind_clear "$name" >/dev/null 2>&1 || true
+            cnt=$((cnt + 1))
+        done <<< "$picks"
+        ok "已把 $cnt 个容器设为入口机直出"
     else
         exit_name="$(sed -n "${e}p" "$ef")"
         rm -f "$ef"
         [ -n "$exit_name" ] || { err "无效编号"; pause_back; return 1; }
-        bind_set "$name" "$exit_name" || { pause_back; return 1; }
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if bind_set "$name" "$exit_name" >/dev/null 2>&1; then
+                cnt=$((cnt + 1))
+            else
+                failed=$((failed + 1)); warn "$name 绑定失败"
+            fi
+        done <<< "$picks"
+        ok "已绑定 $cnt 个容器到 $exit_name$([ "$failed" -gt 0 ] && echo "（失败 $failed 个）")"
     fi
     bindings_refresh
     apply_nft_only
@@ -3048,7 +3112,7 @@ bind_menu_choose() {
 }
 
 bind_menu_remove() {
-    local f n name
+    local f n name sel picks k cnt
     clear_if_tty
     title "解除容器绑定（回到入口机直出）"
     f="$(mktemp)"
@@ -3056,13 +3120,28 @@ bind_menu_remove() {
     subline
     containers_print_numbered "$f"
     subline
+    printf ' 支持多选：空格分隔，如 %s1 2 8%s；%sall%s = 全部容器\n' "$YELLOW" "$NC" "$YELLOW" "$NC"
     printf ' 输入容器编号（0 返回）: '; read -r n || return 0
     case "$n" in 0|"") rm -f "$f"; info "已取消"; return 0 ;; esac
-    case "$n" in *[!0-9]*) rm -f "$f"; err "请输入编号"; pause_back; return 1 ;; esac
-    name="$(sed -n "${n}p" "$f")"
+    sel="$(sel_parse_multi "$n" "$(grep -c . "$f")")" || {
+        rm -f "$f"; err "编号无效：$n（示例：1 2 8 或 all）"; pause_back; return 1
+    }
+    picks=""
+    if [ "$sel" = "ALL" ]; then
+        picks="$(cat "$f")"
+    else
+        for k in $sel; do picks="$picks$(sed -n "${k}p" "$f")"$'\n'; done
+    fi
     rm -f "$f"
-    [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
-    bind_clear "$name"
+    picks="$(printf '%s' "$picks" | sed '/^$/d')"
+    [ -n "$picks" ] || { err "没有可用容器"; pause_back; return 1; }
+    local cnt=0
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        bind_clear "$name" >/dev/null 2>&1 || true
+        cnt=$((cnt + 1))
+    done <<< "$picks"
+    ok "已解除 $cnt 个容器的绑定（回到入口机直出）"
     apply_nft_only
     pause_back
 }
