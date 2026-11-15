@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.3.2
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -38,12 +38,13 @@ CLIENT_DENY_CONF="$CONF_DIR/clients.deny"
 LOGIC_CONF="$CONF_DIR/logical.conf"
 AUTO_GRANT="${AUTO_GRANT:-0}"
 BRIDGE_IPV6_AUTO="${BRIDGE_IPV6_AUTO:-0}"
+BRIDGE_IPV4_AUTO="${BRIDGE_IPV4_AUTO:-0}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.3.2"
+SCRIPT_VERSION="3.4.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -277,6 +278,12 @@ bridge_ipv6() {
     ip -6 -o addr show dev "$b" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
 }
 
+bridge_ipv4() {
+    # 网桥的 IPv4 地址（透明代理入站绑它）
+    local b="${BRIDGE:-incusbr0}"
+    ip -4 -o addr show dev "$b" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
 container_ip6() {
     # 容器的全局/ULA IPv6（跳过 fe80）
     local name="$1"
@@ -464,17 +471,29 @@ gen_nft() {
 }
 
 maybe_revert_bridge_ipv6() {
-    # 只有"网桥 IPv6 是本脚本为拓展节点开的"才还原；已经是别人配的就不动
-    [ "${BRIDGE_IPV6_AUTO:-0}" = "1" ] || return 0
-    # 还有其它拓展节点（含 direct 成员）就保持开启
+    # 只有"网桥地址族是本脚本为拓展节点开的"才还原；别人配的不动
+    local did=0
     if [ -f "$LOGIC_CONF" ] && grep -q '|direct|' "$LOGIC_CONF" 2>/dev/null; then
-        return 0
+        return 0   # 还有拓展节点，保持开启
     fi
-    info "没有拓展节点了，把网桥 IPv6 还原成原来的状态 ..."
-    incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
-    incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
-    save_main_var BRIDGE_IPV6_AUTO 0
-    ok "网桥 IPv6 已还原（$BRIDGE 不再有 IPv6 地址）"
+    if [ "${BRIDGE_IPV6_AUTO:-0}" = "1" ]; then
+        info "没有拓展节点了，把网桥 IPv6 还原成原来的状态 ..."
+        incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
+        incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
+        save_main_var BRIDGE_IPV6_AUTO 0
+        ok "网桥 IPv6 已还原（$BRIDGE 不再有 IPv6 地址）"
+        did=1
+    fi
+    if [ "${BRIDGE_IPV4_AUTO:-0}" = "1" ]; then
+        info "没有拓展节点了，把网桥 IPv4 还原成原来的状态 ..."
+        incus network unset "$BRIDGE" ipv4.address </dev/null >/dev/null 2>&1 || true
+        incus network unset "$BRIDGE" ipv4.nat </dev/null >/dev/null 2>&1 || true
+        save_main_var BRIDGE_IPV4_AUTO 0
+        ok "网桥 IPv4 已还原（$BRIDGE 不再有 IPv4 地址）"
+        did=1
+    fi
+    [ "$did" = "1" ] && load_conf >/dev/null 2>&1 || true
+    return 0
 }
 
 logic_members() {  # $1=节点名
@@ -2030,10 +2049,26 @@ doctor() {
         printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "代理端口被占用" "$pc"
         info "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 归本脚本；请让用户端口映射避开"
     fi
-    local b6
+    local b4 b6 g4 g6
+    b4="$(bridge_ipv4 2>/dev/null)"
     b6="$(bridge_ipv6 2>/dev/null)"
+    g4=0; g6=0
+    ip -4 route show default 2>/dev/null | grep -q default && g4=1
+    ip -6 route show default 2>/dev/null | grep -q default && g6=1
+    # 网桥地址族：按宿主机实际出网能力给出对应提示
+    if [ -n "$b4" ]; then
+        check_item "网桥 IPv4" 0 "$b4"
+    elif [ "$g6" = "1" ] && [ "$g4" = "0" ]; then
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv4" "未启用（宿主只有 IPv6；需要 IPv4 拓展时用 菜单 [2] → [5] 自动开启）"
+    else
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv4" "未启用"
+    fi
     if [ -z "$b6" ]; then
-        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv6" "未启用（只有 IPv4；需要双栈时用 菜单 [2] → [5] 自动开启）"
+        if [ "$g4" = "1" ] && [ "$g6" = "0" ]; then
+            printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv6" "未启用（宿主只有 IPv4；需要 IPv6 拓展/双栈时用 菜单 [2] → [5] 自动开启）"
+        else
+            printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv6" "未启用"
+        fi
     fi
     if [ -n "$b6" ]; then
         check_item "网桥 IPv6" 0 "$b6（双栈透明代理已启用）"
@@ -2436,54 +2471,81 @@ exit_edit_members() {  # $1=节点名
 
 exit_add_extend() {
     # 本机某个家族只能直出时，用远端节点补另一个家族，凑成双栈出口
-    local b6 g4 g6 localfam remfam name proto method pass host port m msel methods i reason mark expect
+    local b4 b6 g4 g6 localfam remfam name proto method pass host port m msel methods i reason mark expect
     clear_if_tty
     title "IPv4 / IPv6 拓展"
     b6="$(bridge_ipv6 2>/dev/null)"
     g4=0; g6=0
     ip -4 route show default 2>/dev/null | grep -q default && g4=1
     ip -6 route show default 2>/dev/null | grep -q default && g6=1
+    b4="$(bridge_ipv4 2>/dev/null)"
     printf '  %-22s %s\n' "宿主机 IPv4 出网" "$([ "$g4" = 1 ] && echo 有 || echo 无)"
     printf '  %-22s %s\n' "宿主机 IPv6 出网" "$([ "$g6" = 1 ] && echo 有 || echo 无)"
+    printf '  %-22s %s\n' "网桥 IPv4" "${b4:-未启用}"
     printf '  %-22s %s\n' "网桥 IPv6" "${b6:-未启用}"
     subline
-    if [ -z "$b6" ]; then
-        warn "网桥没有 IPv6 地址，容器就不会有 IPv6 流量，拓展没有意义"
-        info "需要先给网桥开一段 ULA（不占用公网地址），命令是："
-        info "  incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
-        info "  incus network set $BRIDGE ipv6.nat true"
-        printf '是否现在自动执行？[y/N]: '; read -r a6 || return 0
-        case "$a6" in
-            y|Y) ;;
-            *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
-        esac
-        info "正在给网桥开启 IPv6 ..."
-        if ! incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
-            err "开启失败：incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
-            pause_back; return 1
-        fi
-        incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
-        sleep 2
-        b6="$(bridge_ipv6 2>/dev/null)"
-        if [ -z "$b6" ]; then
-            err "已执行命令，但没取到网桥 IPv6 地址，请检查 incus network show $BRIDGE"
-            pause_back; return 1
-        fi
-        # 记下"这是我们开的"，删除拓展节点时自动还原
-        save_main_var BRIDGE_IPV6_AUTO 1
-        ok "网桥 IPv6 已开启：$b6"
-        info "删除最后一个拓展节点时会自动还原为原来的状态"
+    if [ "$g4" = "0" ] && [ "$g6" = "0" ]; then
+        err "本机既没有 IPv4 也没有 IPv6 出网，无法做拓展"
+        pause_back; return 1
     fi
     if [ "$g4" = "1" ] && [ "$g6" = "1" ]; then
         info "本机已是双栈，直接新增普通出口即可，不需要拓展"
         pause_back; return 1
     fi
+    # 只有单栈时：本机直出一个家族，缺的那个家族由远端补；容器必须有缺的那族的地址
     if [ "$g4" = "1" ]; then
         localfam="v4"; remfam="v6"
-        info "本机有 IPv4：IPv4 走本机直出，需要远端节点补 IPv6 出站"
+        if [ -z "$b6" ]; then
+            warn "网桥没有 IPv6 地址：容器不会有 IPv6 流量，拓展无从生效"
+            info "需要给网桥开一段 ULA（不占用公网地址），命令是："
+            info "  incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
+            info "  incus network set $BRIDGE ipv6.nat true"
+            printf '是否现在自动执行？[y/N]: '; read -r a6 || return 0
+            case "$a6" in
+                y|Y) ;;
+                *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
+            esac
+            info "正在给网桥开启 IPv6 ..."
+            if ! incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
+                err "开启失败：incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
+                pause_back; return 1
+            fi
+            incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
+            sleep 2
+            b6="$(bridge_ipv6 2>/dev/null)"
+            [ -n "$b6" ] || { err "已执行命令但没取到网桥 IPv6，请检查 incus network show $BRIDGE"; pause_back; return 1; }
+            save_main_var BRIDGE_IPV6_AUTO 1
+            ok "网桥 IPv6 已开启：$b6"
+            info "删除最后一个拓展节点时会自动还原"
+        fi
+        info "本机有 IPv4：IPv4 走本机直出，远端节点补 IPv6 出站"
     else
         localfam="v6"; remfam="v4"
-        info "本机只有 IPv6：IPv6 走本机直出，需要远端节点补 IPv4 出站"
+        if [ -z "$b4" ]; then
+            warn "网桥没有 IPv4 地址：容器不会有 IPv4 流量，拓展无从生效"
+            info "需要给网桥开一段私有 IPv4（不占用公网地址），命令是："
+            info "  incus network set $BRIDGE ipv4.address auto"
+            info "  incus network set $BRIDGE ipv4.nat true"
+            printf '是否现在自动执行？[y/N]: '; read -r a4 || return 0
+            case "$a4" in
+                y|Y) ;;
+                *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
+            esac
+            info "正在给网桥开启 IPv4 ..."
+            if ! incus network set "$BRIDGE" ipv4.address auto </dev/null >/dev/null 2>&1; then
+                err "开启失败：incus network set $BRIDGE ipv4.address auto"
+                pause_back; return 1
+            fi
+            incus network set "$BRIDGE" ipv4.nat true </dev/null >/dev/null 2>&1 || true
+            sleep 2
+            b4="$(bridge_ipv4 2>/dev/null)"
+            [ -n "$b4" ] || { err "已执行命令但没取到网桥 IPv4，请检查 incus network show $BRIDGE"; pause_back; return 1; }
+            save_main_var BRIDGE_IPV4_AUTO 1
+            load_conf >/dev/null 2>&1 || true
+            ok "网桥 IPv4 已开启：$b4"
+            info "删除最后一个拓展节点时会自动还原"
+        fi
+        info "本机只有 IPv6：IPv6 走本机直出，远端节点补 IPv4 出站"
     fi
     subline
     printf '节点名称（如 双栈-拓展，输入 0 取消）: '; read -r name || return 0
