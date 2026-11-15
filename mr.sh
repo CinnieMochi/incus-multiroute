@@ -526,88 +526,139 @@ EOF
     printf '  "inbounds": [%s%s],\n  "outbounds": [%s],\n  "route": { "rules": [%s] }\n}\n' "$inb" "$v6in" "$obs" "$rules"
 }
 exit_add_logic() {
-    local name mark lport idx=0 used4=0 used6=0 host port method pass fam ps ms msel methods m reason step
+    local name mark idx=0 used4=0 used6=0
+    local step host port method pass fam ps msel methods m reason st
     clear_if_tty
     title "新增逻辑节点（IPv4 + IPv6 组合）"
     info "一个逻辑节点最多两个成员：一个提供 IPv4、一个提供 IPv6"
     info "用户访问 v4 网站走 v4 成员，访问 v6 网站走 v6 成员"
+    info "每一步输入 0 都可以返回上一步"
     if ! singbox_installed; then
         err "还没有安装 sing-box（逻辑节点依赖它）"
         info "请先到菜单 [14] → [3] 安装"
         pause_back; return 1
     fi
-    printf '节点名称（如 双栈-HK，输入 0 返回）: '; read -r name
-    case "$name" in 0|"") info "已取消"; return 0 ;; esac
-    [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
-    exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
+    while :; do
+        printf '节点名称（输入 0 返回菜单）: '; read -r name
+        case "$name" in 0|"") info "已取消"; return 0 ;; esac
+        [ -n "$name" ] || { err "名称不能为空"; continue; }
+        if exit_exists "$name"; then err "出口已存在: $name"; continue; fi
+        break
+    done
+
     while :; do
         idx=$((idx + 1))
         subline
         printf '  %s成员 %s%s\n' "$BLUE" "$idx" "$NC"
-        printf '\n协议类型：\n'
-        printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
-        printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
-        printf '  %s[0]%s 返回上一步（重新输入节点名称）\n' "$YELLOW" "$NC"
-        printf '请输入 [0-2]（回车=1）: '
-        read -r ps
-        case "$ps" in
-            0) info "已返回上一步"; idx=$((idx - 1)); continue_outer=1; break ;;
-            2) step="ss" ;;
-            *) step="ss2022" ;;
-        esac
-        if [ "$step" = "ss2022" ]; then
-            methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
-        else
-            methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
-        fi
-        printf '加密方式:\n'
-        i=1
-        for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
-        local mcount
-        mcount="$(printf '%s\n' $methods | grep -c .)"
-        printf '请选择 [1-%s]: ' "$mcount"
-        read -r msel
-        case "$msel" in ''|*[!0-9]*) msel=1 ;; esac
-        method="$(printf '%s\n' $methods | sed -n "${msel}p")"
-        [ -n "$method" ] || method="$(printf '%s\n' $methods | head -1)"
-        printf '服务器地址: '; read -r host
-        case "$host" in 0|"") info "已取消"; logic_del_node "$name"; return 0 ;; esac
-        printf '端口: '; read -r port
-        case "$port" in ''|*[!0-9]*) err "端口必须是数字"; logic_del_node "$name"; return 1 ;; esac
+        st="proto"
         while :; do
-            printf '密码（输入 0 返回）: '; read -r pass
-            case "$pass" in 0|"") info "已取消"; logic_del_node "$name"; return 0 ;; esac
-            if [ "$step" = "ss2022" ]; then
-                if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
-                err "密码格式不对：$reason"; continue
-            fi
-            break
+            case "$st" in
+                proto)
+                    printf '\n协议类型（0=返回上一步）：\n'
+                    printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
+                    printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
+                    printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
+                    printf '请输入 [0-2]（回车=1）: '
+                    read -r ps
+                    case "$ps" in
+                        0)
+                            if [ "$idx" -le 1 ]; then
+                                info "已取消并删除该节点"; logic_del_node "$name"; return 0
+                            fi
+                            info "已返回上一步（重新输入节点名称）"
+                            logic_del_node "$name"; return 0
+                            ;;
+                        2) step="ss" ;;
+                        *) step="ss2022" ;;
+                    esac
+                    if [ "$step" = "ss2022" ]; then
+                        methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+                    else
+                        methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+                    fi
+                    st="method"
+                    ;;
+                method)
+                    printf '加密方式（0=返回上一步）：\n'
+                    i=1
+                    for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+                    printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
+                    printf '请选择 [0-%s]: ' "$((i - 1))"
+                    read -r msel
+                    case "$msel" in
+                        0) st="proto"; continue ;;
+                        ''|*[!0-9]*) err "请输入数字"; continue ;;
+                    esac
+                    method="$(printf '%s\n' $methods | sed -n "${msel}p")"
+                    [ -n "$method" ] || { err "无效选择"; continue; }
+                    st="host"
+                    ;;
+                host)
+                    printf '服务器地址（0=返回上一步）: '; read -r host
+                    [ "$host" = "0" ] && { st="method"; continue; }
+                    [ -n "$host" ] || { err "地址不能为空"; continue; }
+                    st="port"
+                    ;;
+                port)
+                    printf '端口（0=返回上一步）: '; read -r port
+                    [ "$port" = "0" ] && { st="host"; continue; }
+                    case "$port" in ''|*[!0-9]*) err "端口必须是数字"; continue ;; esac
+                    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then err "端口范围 1-65535"; continue; fi
+                    st="pass"
+                    ;;
+                pass)
+                    printf '密码（0=返回上一步）: '; read -r pass
+                    [ "$pass" = "0" ] && { st="port"; continue; }
+                    [ -n "$pass" ] || { err "密码不能为空"; continue; }
+                    if [ "$step" = "ss2022" ]; then
+                        if ! reason="$(ss2022_pass_check "$method" "$pass")"; then
+                            err "密码不符合 $method 的格式：$reason"
+                            info "单密钥：16/32 字节的 base64；双密钥：两段 base64 用 : 连接"
+                            continue
+                        fi
+                    fi
+                    st="fam"
+                    ;;
+                fam)
+                    if [ "$used4" = "1" ]; then
+                        fam="v6"; info "IPv4 槽已被占用，本成员固定为 IPv6"
+                    elif [ "$used6" = "1" ]; then
+                        fam="v4"; info "IPv6 槽已被占用，本成员固定为 IPv4"
+                    else
+                        printf '这台机器给节点提供哪种地址（0=返回上一步）?\n'
+                        printf '  %s[1]%s IPv4\n' "$GREEN" "$NC"
+                        printf '  %s[2]%s IPv6\n' "$GREEN" "$NC"
+                        printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
+                        printf '请输入 [0-2]: '; read -r fs
+                        case "$fs" in
+                            0) st="pass"; continue ;;
+                            2) fam="v6" ;;
+                            *) fam="v4" ;;
+                        esac
+                    fi
+                    st="done"
+                    ;;
+                done) break ;;
+            esac
         done
-        if [ "$used4" = "1" ] && [ "$used6" = "1" ]; then
-            err "两个家族都已占满，不能继续添加"; logic_del_node "$name"; return 1
-        fi
-        if [ "$used4" = "1" ]; then
-            fam="v6"; info "IPv4 槽已被成员占用，本成员固定为 IPv6"
-        elif [ "$used6" = "1" ]; then
-            fam="v4"; info "IPv6 槽已被成员占用，本成员固定为 IPv4"
-        else
-            printf '这台机器给节点提供哪种地址? [1] IPv4  [2] IPv6: '; read -r fs
-            case "$fs" in 2) fam="v6" ;; *) fam="v4" ;; esac
-        fi
         printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$idx" "$step" "$host" "$port" "$method" "$pass" "$fam" >> "$LOGIC_CONF"
         [ "$fam" = "v4" ] && used4=1 || used6=1
+        info "已加入成员 $idx（$(proto_label "$step") / $fam / $host:$port）"
         if [ "$fam" = "v6" ] && ! ip -6 route show default 2>/dev/null | grep -q default; then
             warn "本机没有 IPv6 默认路由：这个 v6 成员会连不上（除非以后给宿主机配 IPv6）"
         fi
-        info "已加入成员 $idx（$step / $fam / $host:$port）"
         if [ "$used4" = "1" ] && [ "$used6" = "1" ]; then
             info "IPv4 与 IPv6 成员都已就绪"; break
         fi
         printf '继续添加另一个家族的成员? [Y/n]: '; read -r a
         case "$a" in [nN]) break ;; esac
     done
-    printf '期望出口 IP（可留空，输入 0 取消整个节点）: '; read -r expect
-    case "$expect" in 0) logic_del_node "$name"; info "已取消"; return 0 ;; esac
+
+    while :; do
+        printf '期望出口 IP（可留空；输入 0 删除整个节点）: '; read -r expect
+        [ "$expect" = "0" ] && { logic_del_node "$name"; info "已取消"; return 0; }
+        break
+    done
     mark="$(mark_next)"
     printf '%s|logic||0|||%s||||%s|1|\n' "$name" "$mark" "$expect" >> "$EXITS_CONF"
     ok "已新增逻辑节点 $name（mark $mark，成员 $(logic_members "$name" | grep -c .) 个）"

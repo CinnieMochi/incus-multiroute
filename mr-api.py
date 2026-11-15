@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF_DIR = "/etc/incus-multiroute"
 EXITS_CONF = os.path.join(CONF_DIR, "exits.conf")
+LOGIC_CONF = os.path.join(CONF_DIR, "logical.conf")
 BIND_CONF = os.path.join(CONF_DIR, "bindings.conf")
 TOKEN_CONF = os.path.join(CONF_DIR, "tokens.conf")
 ALLOW_CONF = os.path.join(CONF_DIR, "clients.conf")
@@ -53,6 +54,25 @@ def load_exits():
                          wgkey=f[7], wgif=f[8], local=f[9],
                          expect=f[10], enable=f[11])
     return out
+
+
+def is_extend_exit(name):
+    """拓展节点：逻辑节点里含 direct 成员（本机直出 + 远端补另一家族）。
+    这类出口要排在「入口机」之后、其它出口之前，用户一眼就能找到。"""
+    try:
+        with open(LOGIC_CONF, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("|")
+                if len(parts) >= 3 and parts[0] == name and parts[2] == "direct":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def ordered_exit_names(exits):
+    names = list(exits.keys())
+    return sorted(names, key=lambda n: (0 if is_extend_exit(n) else 1, names.index(n)))
 
 
 def load_bindings():
@@ -288,7 +308,8 @@ class Handler(BaseHTTPRequestHandler):
             name = self.auth()
             if not name:
                 return
-            exits = [e for e, v in load_exits().items() if v["enable"] != "0"]
+            _all = load_exits()
+            exits = [e for e in ordered_exit_names(_all) if _all[e]["enable"] != "0"]
             current = self.current_of(name)
             return self.jreply({"ok": True, "container": name,
                                 "current": exit_display(current),
