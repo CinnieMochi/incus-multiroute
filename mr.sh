@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.7.0
+# Incus MultiRoute 宿主机出口管理脚本 v3.0.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -35,13 +35,14 @@ CLIENT_BASE="$DATA_DIR/client/out"
 CLIENT_HASH="$CONF_DIR/client.sha256"
 CLIENT_ALLOW_CONF="$CONF_DIR/clients.conf"
 CLIENT_DENY_CONF="$CONF_DIR/clients.deny"
+LOGIC_CONF="$CONF_DIR/logical.conf"
 AUTO_GRANT="${AUTO_GRANT:-0}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="3.0.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -115,6 +116,7 @@ ensure_dirs() {
     [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
     [ -f "$BIND_CONF" ]  || printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
     [ -f "$TOKEN_CONF" ] || { : > "$TOKEN_CONF"; chmod 600 "$TOKEN_CONF"; }
+    [ -f "$LOGIC_CONF" ] || printf '%s\n' '# 节点|序号|协议|地址|端口|加密|密码|家族(v4/v6)' > "$LOGIC_CONF"
     if [ ! -f "$CONF_DIR/api.conf" ]; then
         # 默认只绑网桥地址，避免 API 暴露到公网
         local _gw
@@ -214,7 +216,7 @@ exit_ss_port() {
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
         IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
-        case "$proto" in ss|ss2022) ;; *) continue ;; esac
+        case "$proto" in ss|ss2022|logic) ;; *) continue ;; esac
         i=$((i + 1))
         if [ "$name" = "$want" ]; then
             # 第 13 字段是"指定端口"：被占用时给这个出口单独分配的号，优先使用
@@ -264,6 +266,26 @@ in_bridge_subnet() {  # $1=IP  $2=网桥 CIDR（如 10.10.0.1/22）
     ipi="$(ip2int "$ip")"; neti="$(ip2int "$net")"
     mi=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
     [ $(( ipi & mi )) -eq $(( neti & mi )) ]
+}
+
+bridge_ipv6() {
+    # 网桥上可用于代理的 IPv6 地址（跳过链路本地）
+    local b="${BRIDGE:-incusbr0}"
+    ip -6 -o addr show dev "$b" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+container_ip6() {
+    # 容器的全局/ULA IPv6（跳过 fe80）
+    local name="$1"
+    incus list --format=csv -c n6 2>/dev/null | awk -F, -v n="$name" '
+        $1 == n {
+            ip = $2; gsub(/"/, "", ip); sub(/ *\(.*/, "", ip)
+            c = split(ip, a, " ")
+            for (i = 1; i <= c; i++) {
+                if (a[i] ~ /^fe80:/) continue
+                if (a[i] ~ /:/) { print a[i]; exit }
+            }
+        }'
 }
 
 containers_scan() {
@@ -373,6 +395,27 @@ gen_nft() {
     local elems="" l ts
     ts="$(date +%Y-%m-%d\ %H:%M:%S)"
     elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
+    # IPv6：只有网桥配了 IPv6 才启用整套 v6 规则
+    BRIDGE6="$(bridge_ipv6 2>/dev/null)"
+    local has6=0 elems6=""
+    if [ -n "$BRIDGE6" ]; then
+        has6=1
+        local _bn _bip _bex _bmark _b6 _first6=1
+        while IFS='|' read -r _bn _bip _bex _bmark; do
+            case "$_bn" in ''|'#'*) continue ;; esac
+            [ -n "$_bmark" ] || continue
+            _b6="$(container_ip6 "$_bn" 2>/dev/null)"
+            [ -n "$_b6" ] || continue
+            if [ "$_first6" = "1" ]; then
+                elems6="
+        $_b6 : $_bmark"
+                _first6=0
+            else
+                elems6="$elems6,
+        $_b6 : $_bmark"
+            fi
+        done < "$BIND_CONF"
+    fi
     {
         echo "# 由 Incus MultiRoute 生成于 $ts —— 请勿手改"
         echo 'table inet multiroute {'
@@ -382,15 +425,26 @@ gen_nft() {
         else
             printf '    map c_ip {\n        type ipv4_addr : mark\n    }\n'
         fi
+        # ---- IPv6 部分（仅在网桥有 IPv6 时生成）----
+        if [ "$has6" = "1" ]; then
+            printf '    set bypass6 {\n        type ipv6_addr\n        flags interval\n        elements = { ::1/128, fe80::/10, fc00::/7 }\n    }\n'
+            if [ -n "$elems6" ]; then
+                printf '    map c_ip6 {\n        type ipv6_addr : mark\n        elements = {%s\n        }\n    }\n' "$elems6"
+            else
+                printf '    map c_ip6 {\n        type ipv6_addr : mark\n    }\n'
+            fi
+        fi
         # 透明代理：TCP + UDP 都走 tproxy（需要 br_netfilter=0）
         echo '    chain prerouting {'
         echo '        type filter hook prerouting priority mangle; policy accept;'
         echo "        iifname \"$BRIDGE\" ip daddr @bypass4 return"
+        [ "$has6" = "1" ] && echo "        iifname \"$BRIDGE\" ip6 daddr @bypass6 return"
         echo "        iifname \"$BRIDGE\" meta mark set ip saddr map @c_ip"
+        [ "$has6" = "1" ] && echo "        iifname \"$BRIDGE\" meta mark set ip6 saddr map @c_ip6"
         echo "        iifname \"$BRIDGE\" meta mark 0x0 return"
-        # 注意：这里绝不能加 "socket transparent 1 accept"，它会把所有包直接放行走宿主，
-        # 导致 tproxy 永远不执行（实测踩过这个坑）
+        # 注意：这里绝不能加 "socket transparent 1 accept"，它会把包直接放行走宿主
         exits_each emit_tproxy
+        [ "$has6" = "1" ] && exits_each emit_tproxy6
         echo '    }'
         # 防止外部直接访问本机代理端口（sing-box 监听 0.0.0.0）
         echo '    chain input_guard {'
@@ -406,11 +460,159 @@ gen_nft() {
     } > "$NFT_FILE"
 }
 
+logic_members() {  # $1=节点名
+    [ -f "$LOGIC_CONF" ] || return 0
+    grep -v '^#' "$LOGIC_CONF" 2>/dev/null | awk -F'|' -v n="$1" '$1==n'
+}
+
+logic_del_node() {
+    [ -f "$LOGIC_CONF" ] || return 0
+    grep -v "^$1|" "$LOGIC_CONF" > "$LOGIC_CONF.tmp" 2>/dev/null || :
+    mv -f "$LOGIC_CONF.tmp" "$LOGIC_CONF"
+}
+
+logic_cfg_json() {  # $1=节点名 $2=本地端口 → 输出 sing-box 配置
+    local node="$1" lport="$2"
+    local obs="" dns="" rules="" sv4=0 sv6=0
+    local line _n idx proto host port method pass fam tag ob rule
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in '#'*) continue ;; esac
+        _n="$(printf '%s' "$line" | cut -d'|' -f1)"
+        [ "$_n" = "$node" ] || continue
+        idx="$(printf '%s' "$line" | cut -d'|' -f2)"
+        host="$(printf '%s' "$line" | cut -d'|' -f4)"
+        port="$(printf '%s' "$line" | cut -d'|' -f5)"
+        method="$(printf '%s' "$line" | cut -d'|' -f6)"
+        pass="$(printf '%s' "$line" | cut -d'|' -f7)"
+        fam="$(printf '%s' "$line" | cut -d'|' -f8)"
+        [ -n "$fam" ] || continue
+        tag="m${idx}-${fam}"
+        if [ "$fam" = "v4" ]; then sv4=1; else sv6=1; fi
+        ob="{\"type\":\"shadowsocks\",\"tag\":\"$tag\",\"server\":\"$(json_esc "$host")\",\"server_port\":$port,\"method\":\"$(json_esc "$method")\",\"password\":\"$(json_esc "$pass")\",\"domain_resolver\":\"res-$fam\"}"
+        if [ -z "$obs" ]; then obs="$ob"; else obs="$obs,$ob"; fi
+        rule="{\"ip_version\":${fam#v},\"outbound\":\"$tag\"}"
+        if [ -z "$rules" ]; then rules="$rule"; else rules="$rules,$rule"; fi
+    done <<EOF
+$(logic_members "$node")
+EOF
+    if [ "$sv4" = "1" ]; then
+        dns='{"tag":"res-v4","type":"udp","server":"1.1.1.1","domain_strategy":"ipv4_only"}'
+    fi
+    if [ "$sv6" = "1" ]; then
+        local d6='{"tag":"res-v6","type":"udp","server":"2606:4700:4700::1111","domain_strategy":"ipv6_only"}'
+        if [ -n "$dns" ]; then dns="$dns,$d6"; else dns="$d6"; fi
+    fi
+    local inb v6in b6
+    inb="{\"type\":\"tproxy\",\"tag\":\"tproxy-in\",\"listen\":\"$(json_esc "${SUBNET_GW:-0.0.0.0}")\",\"listen_port\":${lport},\"network\":[\"tcp\",\"udp\"]}"
+    v6in=""
+    b6="$(bridge_ipv6 2>/dev/null)"
+    if [ -n "$b6" ]; then
+        v6in=",{\"type\":\"tproxy\",\"tag\":\"tproxy-in6\",\"listen\":\"$(json_esc "$b6")\",\"listen_port\":${lport},\"network\":[\"tcp\",\"udp\"]}"
+    fi
+    printf '{\n  "log": { "level": "warn" },\n'
+    [ -n "$dns" ] && printf '  "dns": { "servers": [%s] },\n' "$dns"
+    printf '  "inbounds": [%s%s],\n  "outbounds": [%s],\n  "route": { "rules": [%s] }\n}\n' "$inb" "$v6in" "$obs" "$rules"
+}
+exit_add_logic() {
+    local name mark lport idx=0 used4=0 used6=0 host port method pass fam ps ms msel methods m reason step
+    clear_if_tty
+    title "新增逻辑节点（IPv4 + IPv6 组合）"
+    info "一个逻辑节点最多两个成员：一个提供 IPv4、一个提供 IPv6"
+    info "用户访问 v4 网站走 v4 成员，访问 v6 网站走 v6 成员"
+    if ! singbox_installed; then
+        err "还没有安装 sing-box（逻辑节点依赖它）"
+        info "请先到菜单 [14] → [3] 安装"
+        pause_back; return 1
+    fi
+    printf '节点名称（如 双栈-HK，输入 0 返回）: '; read -r name
+    case "$name" in 0|"") info "已取消"; return 0 ;; esac
+    [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
+    exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
+    while :; do
+        idx=$((idx + 1))
+        subline
+        printf '  %s成员 %s%s\n' "$BLUE" "$idx" "$NC"
+        printf '协议: [1] ss2022  [2] ss   （回车=1）: '; read -r ps
+        case "$ps" in 2) step="ss" ;; *) step="ss2022" ;; esac
+        if [ "$step" = "ss2022" ]; then
+            methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+        else
+            methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+        fi
+        printf '加密方式:\n'
+        i=1
+        for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+        local mcount
+        mcount="$(printf '%s\n' $methods | grep -c .)"
+        printf '请选择 [1-%s]: ' "$mcount"
+        read -r msel
+        case "$msel" in ''|*[!0-9]*) msel=1 ;; esac
+        method="$(printf '%s\n' $methods | sed -n "${msel}p")"
+        [ -n "$method" ] || method="$(printf '%s\n' $methods | head -1)"
+        printf '服务器地址: '; read -r host
+        case "$host" in 0|"") info "已取消"; logic_del_node "$name"; return 0 ;; esac
+        printf '端口: '; read -r port
+        case "$port" in ''|*[!0-9]*) err "端口必须是数字"; logic_del_node "$name"; return 1 ;; esac
+        while :; do
+            printf '密码（输入 0 返回）: '; read -r pass
+            case "$pass" in 0|"") info "已取消"; logic_del_node "$name"; return 0 ;; esac
+            if [ "$step" = "ss2022" ]; then
+                if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
+                err "密码格式不对：$reason"; continue
+            fi
+            break
+        done
+        if [ "$used4" = "1" ] && [ "$used6" = "1" ]; then
+            err "两个家族都已占满，不能继续添加"; logic_del_node "$name"; return 1
+        fi
+        if [ "$used4" = "1" ]; then
+            fam="v6"; info "IPv4 槽已被成员占用，本成员固定为 IPv6"
+        elif [ "$used6" = "1" ]; then
+            fam="v4"; info "IPv6 槽已被成员占用，本成员固定为 IPv4"
+        else
+            printf '这台机器给节点提供哪种地址? [1] IPv4  [2] IPv6: '; read -r fs
+            case "$fs" in 2) fam="v6" ;; *) fam="v4" ;; esac
+        fi
+        printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$idx" "$step" "$host" "$port" "$method" "$pass" "$fam" >> "$LOGIC_CONF"
+        [ "$fam" = "v4" ] && used4=1 || used6=1
+        if [ "$fam" = "v6" ] && ! ip -6 route show default 2>/dev/null | grep -q default; then
+            warn "本机没有 IPv6 默认路由：这个 v6 成员会连不上（除非以后给宿主机配 IPv6）"
+        fi
+        info "已加入成员 $idx（$step / $fam / $host:$port）"
+        if [ "$used4" = "1" ] && [ "$used6" = "1" ]; then
+            info "IPv4 与 IPv6 成员都已就绪"; break
+        fi
+        printf '继续添加另一个家族的成员? [Y/n]: '; read -r a
+        case "$a" in [nN]) break ;; esac
+    done
+    printf '期望出口 IP（可留空，输入 0 取消整个节点）: '; read -r expect
+    case "$expect" in 0) logic_del_node "$name"; info "已取消"; return 0 ;; esac
+    mark="$(mark_next)"
+    printf '%s|logic||0|||%s||||%s|1|\n' "$name" "$mark" "$expect" >> "$EXITS_CONF"
+    ok "已新增逻辑节点 $name（mark $mark，成员 $(logic_members "$name" | grep -c .) 个）"
+    info "正在下发规则 ..."
+    apply_all
+    pause_back
+}
+emit_tproxy6() {
+    local name="$1" proto="$2" mark="$7" enable="${12}"
+    [ "$enable" = "0" ] && return 0
+    [ -n "${BRIDGE6:-}" ] || return 0
+    case "$proto" in
+        ss|ss2022|logic)
+            local port
+            port="$(exit_ss_port "$name")"
+            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip6 to [$BRIDGE6]:$port meta mark set 0x80000001"
+            ;;
+    esac
+}
+
 emit_tproxy() {
     local name="$1" proto="$2" mark="$7" enable="${12}"
     [ "$enable" = "0" ] && return 0
     case "$proto" in
-        ss|ss2022)
+        ss|ss2022|logic)
             local port
             port="$(exit_ss_port "$name")"
             # ct direction original：只劫持"容器主动发起"的包。
@@ -484,6 +686,58 @@ ensure_wg_key() {
     printf ' %s宿主机公钥%s（填进出口机 wg 配置的 [Peer] PublicKey）:\n  %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$pub" "$NC"
 }
 
+b64_bytes() {
+    # base64 解码后的字节数；非法 base64 返回 0
+    local s="$1" n
+    [ -n "$s" ] || { echo 0; return; }
+    case "$s" in *[!A-Za-z0-9+/=]*) echo 0; return ;; esac
+    if has_cmd base64; then
+        n="$(printf '%s' "$s" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+        echo "${n:-0}"
+    else
+        # 没有 base64 工具时按长度估算：24/22 字符=16 字节，44/43 字符=32 字节
+        case "${#s}" in
+            24|22) echo 16 ;;
+            44|43) echo 32 ;;
+            *) echo 0 ;;
+        esac
+    fi
+}
+
+ss2022_pass_check() {  # $1=method $2=password → 成功时输出 ok，失败时输出原因并返回 1
+    # 支持两种形式：
+    #   单密钥   base64(16B 或 32B)
+    #   双密钥   base64(16B或32B):base64(16B或32B)   ← 服务端多用户/中转场景
+    local method="$1" pass="$2" want k1 k2 b1 b2
+    case "$method" in
+        2022-blake3-aes-128-gcm|2022-blake3-chacha20-poly1305) want=16 ;;
+        2022-blake3-aes-256-gcm) want=32 ;;
+        *) echo ok; return 0 ;;
+    esac
+    case "$pass" in
+        *:*)
+            k1="${pass%%:*}"; k2="${pass#*:}"
+            b1="$(b64_bytes "$k1")"; b2="$(b64_bytes "$k2")"
+            if [ "$b1" = "$want" ] && [ "$b2" = "$want" ]; then echo ok; return 0; fi
+            echo "双密钥格式要求冒号两侧各 ${want} 字节 base64（当前 ${b1}/${b2} 字节）"
+            return 1
+            ;;
+        *)
+            b1="$(b64_bytes "$pass")"
+            if [ "$b1" = "$want" ]; then echo ok; return 0; fi
+            echo "该算法要求 ${want} 字节 base64 密钥（当前 ${b1} 字节）"
+            return 1
+            ;;
+    esac
+}
+
+ss_classic_pass_check() {  # $1=password
+    local pass="$1"
+    [ -n "$pass" ] || { echo "密码不能为空"; return 1; }
+    echo ok
+    return 0
+}
+
 json_esc() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -517,7 +771,7 @@ ss_enabled_count() {
         case "$l" in ''|'#'*) continue ;; esac
         IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
         case "$proto" in
-            ss|ss2022) [ "${enable:-1}" != "0" ] && n=$((n + 1)) ;;
+            ss|ss2022|logic) [ "${enable:-1}" != "0" ] && n=$((n + 1)) ;;
         esac
     done < "$EXITS_CONF"
     echo "$n"
@@ -527,20 +781,35 @@ tproxy_routing_on() {
     ip rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
     ip rule add fwmark 0x80000001 lookup 1001 priority 900 2>/dev/null || true
     ip route replace local 0.0.0.0/0 dev lo table 1001 2>/dev/null || true
+    # IPv6：网桥有 v6 时才建 v6 的 tproxy 回环路由
+    if [ -n "$(bridge_ipv6 2>/dev/null)" ]; then
+        ip -6 rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
+        ip -6 rule add fwmark 0x80000001 lookup 1001 priority 900 2>/dev/null || true
+        ip -6 route replace local ::/0 dev lo table 1001 2>/dev/null || true
+    else
+        # 网桥没有 IPv6 时把残留的 v6 策略路由清掉
+        ip -6 rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
+        ip -6 route flush table 1001 2>/dev/null || true
+    fi
 }
 
 tproxy_routing_off() {
     ip rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
     ip route flush table 1001 2>/dev/null || true
+    ip -6 rule del fwmark 0x80000001 lookup 1001 2>/dev/null || true
+    ip -6 route flush table 1001 2>/dev/null || true
 }
 
 ensure_tproxy_sysctl() {
-    local cur
+    local cur cur6
     cur="$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null || echo 1)"
-    if [ "$cur" != "0" ]; then
+    cur6="$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null || echo 1)"
+    if [ "$cur" != "0" ] || [ "$cur6" != "0" ]; then
         printf '%s\n' '# Incus MultiRoute：TPROXY 需要关闭 br_netfilter 对桥接帧的劫持' \
-            'net.bridge.bridge-nf-call-iptables = 0' > /etc/sysctl.d/90-incus-multiroute.conf
+            'net.bridge.bridge-nf-call-iptables = 0' \
+            'net.bridge.bridge-nf-call-ip6tables = 0' > /etc/sysctl.d/90-incus-multiroute.conf
         sysctl -qw net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+        sysctl -qw net.bridge.bridge-nf-call-ip6tables=0 2>/dev/null || true
         warn "已关闭 net.bridge.bridge-nf-call-iptables（容器间二层流量不再经过防火墙）"
     fi
 }
@@ -548,6 +817,7 @@ ensure_tproxy_sysctl() {
 remove_tproxy_sysctl() {
     rm -f /etc/sysctl.d/90-incus-multiroute.conf
     sysctl -qw net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true
+    sysctl -qw net.bridge.bridge-nf-call-ip6tables=1 2>/dev/null || true
 }
 
 apply_ss_units() {
@@ -556,7 +826,7 @@ apply_ss_units() {
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp <<< "$l"
-        case "$proto" in ss|ss2022) ;; *) continue ;; esac
+        case "$proto" in ss|ss2022|logic) ;; *) continue ;; esac
         local u="mr-ss-$mark.service"
         if [ "$enable" = "0" ]; then
             systemctl disable --now "$u" >/dev/null 2>&1 || true
@@ -576,14 +846,21 @@ apply_ss_units() {
         esac
         # sing-box：tproxy 入站（TCP+UDP），shadowsocks 出站
         local newcfg newunit
+        if [ "$proto" = "logic" ]; then
+            newcfg="$(logic_cfg_json "$name" "$lport")"
+        else
+        local inb v6in
+        inb="$(printf '{"type":"tproxy","tag":"tproxy-in","listen":"%s","listen_port":%s,"network":["tcp","udp"]}' \
+            "$(json_esc "${SUBNET_GW:-0.0.0.0}")" "$lport")"
+        v6in=""
+        if [ -n "$(bridge_ipv6 2>/dev/null)" ]; then
+            v6in=",$(printf '{"type":"tproxy","tag":"tproxy-in6","listen":"%s","listen_port":%s,"network":["tcp","udp"]}' \
+                "$(json_esc "$(bridge_ipv6)")" "$lport")"
+        fi
         newcfg="$(cat <<EOF
 {
   "log": { "level": "warn" },
-  "inbounds": [{
-    "type": "tproxy", "tag": "tproxy-in",
-    "listen": "${SUBNET_GW:-0.0.0.0}", "listen_port": $lport,
-    "network": ["tcp", "udp"]
-  }],
+  "inbounds": [$inb$v6in],
   "outbounds": [{
     "type": "shadowsocks", "tag": "ss",
     "server": "$(json_esc "$host")",
@@ -594,6 +871,7 @@ apply_ss_units() {
 }
 EOF
 )"
+        fi
         newunit="$(cat <<EOF
 [Unit]
 Description=Incus MultiRoute sing-box ($name)
@@ -673,13 +951,14 @@ apply_nft_only() {
     load_conf
     require_root
     gen_nft
-    if ! nft -c -f "$NFT_FILE" 2>/tmp/mr.nft.err; then
+    sed 's/^table inet multiroute {/table inet multiroute_chk {/' "$NFT_FILE" > "$NFT_FILE.chk" 2>/dev/null
+    if ! nft -c -f "$NFT_FILE.chk" 2>/tmp/mr.nft.err; then
         err "生成的 nft 规则不合法，已保留现有规则不动"
         sed -n '1,5p' /tmp/mr.nft.err >&2
         rm -f /tmp/mr.nft.err
         return 1
     fi
-    rm -f /tmp/mr.nft.err
+    rm -f /tmp/mr.nft.err "$NFT_FILE.chk"
     nft delete table inet multiroute 2>/dev/null || true
     nft -f "$NFT_FILE" || return 1
     if [ "$(ss_enabled_count)" -gt 0 ]; then
@@ -1644,8 +1923,23 @@ doctor() {
         printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "代理端口被占用" "$pc"
         info "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 归本脚本；请让用户端口映射避开"
     fi
+    local b6
+    b6="$(bridge_ipv6 2>/dev/null)"
+    if [ -n "$b6" ]; then
+        check_item "网桥 IPv6" 0 "$b6（双栈透明代理已启用）"
+        if ip -6 rule show 2>/dev/null | grep -q "lookup 1001"; then
+            check_item "IPv6 tproxy 策略路由" 0 "fwmark 0x80000001 → table 1001"
+        else
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "IPv6 tproxy 策略路由" "缺失，按 10 重新下发"
+        fi
+        [ "$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)" = "0" ] \
+            && check_item "br_netfilter(IPv6) 已关闭" 0 "双栈必需" \
+            || printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter(IPv6) 未关闭" "v6 tproxy 会不通，按 10 重新下发"
+    fi
     if ip -6 route show default 2>/dev/null | grep -q default; then
-        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机有 IPv6 出网" "容器 IPv6 流量不会走出口（只代理 IPv4），如需隐藏请禁用容器 IPv6"
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机有 IPv6 出网" "可用于 IPv6 成员/出口"
+    elif [ -n "$b6" ]; then
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机无 IPv6 出网" "v6 目标仍可经 v4 隧道访问，但不能直连 v6 出口机"
     fi
     if [ "$(ss_enabled_count 2>/dev/null)" -gt 0 ] 2>/dev/null; then
         if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "0" ]; then
@@ -1772,20 +2066,22 @@ exit_add() {
     printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
     printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
     printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
+    printf '  %s[4]%s 逻辑节点（用多台机器拼一个 IPv4 + IPv6 出口）\n' "$GREEN" "$NC"
     printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
-    printf '请输入 [0-3]: '
+    printf '请输入 [0-4]: '
     read -r proto_sel
     case "$proto_sel" in
         1) proto="ss2022" ;;
         2) proto="ss" ;;
         3) proto="wg" ;;
+        4) proto="logic"; exit_add_logic; return $? ;;
         0|"") info "已取消"; return 0 ;;
         *) err "无效选择"; pause_back; return 1 ;;
     esac
 
     # 依赖前置检查：缺客户端就不再往下问
     case "$proto" in
-        ss|ss2022)
+        ss|ss2022|logic)
             if ! singbox_installed; then
                 err "还没有安装 sing-box（ss/ss2022 客户端）"
                 info "请先到 菜单 [14] → [3] 安装，装完再回来新增 $proto 出口"
@@ -1854,14 +2150,19 @@ exit_add() {
         [ -n "$method" ] || { err "无效选择"; pause_back; return 1; }
 
         printf '端口 [2525]: '; read -r port; [ -n "$port" ] || port=2525
-        printf '密码（输入 0 返回）: '; read -r pass
-        case "$pass" in 0|"") info "已取消"; return 0 ;; esac
-        case "$proto:$method" in
-            ss2022:2022-blake3-aes-128-gcm|ss2022:2022-blake3-chacha20-poly1305)
-                [ ${#pass} -ge 20 ] || warn "该算法要求 16 字节 base64 密码（通常 24 字符），当前 ${#pass} 字符，请确认" ;;
-            ss2022:2022-blake3-aes-256-gcm)
-                [ ${#pass} -ge 40 ] || warn "该算法要求 32 字节 base64 密码（通常 44 字符），当前 ${#pass} 字符，请确认" ;;
-        esac
+        while :; do
+            printf '密码（输入 0 返回）: '; read -r pass
+            case "$pass" in 0|"") info "已取消"; return 0 ;; esac
+            if [ "$proto" = "ss2022" ]; then
+                if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
+                err "密码不符合 $method 的格式：$reason"
+                info "单密钥示例: $(printf '%*s' 16 '' | tr ' ' 'A' | base64 -w0)"
+                info "双密钥示例: 两段各自 base64 后用 : 连接"
+                continue
+            fi
+            reason="$(ss_classic_pass_check "$pass")" || { err "$reason"; continue; }
+            break
+        done
         wgkey=""; wgif=""; local=""
     fi
 
@@ -1873,7 +2174,7 @@ exit_add() {
     # 老出口保持原端口不动（不会重启、不会断线）
     local lp=""
     case "$proto" in
-        ss|ss2022)
+        ss|ss2022|logic)
             local cand owner np ssn
             ssn="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' '$2=="ss"||$2=="ss2022"{n++} END{print n+0}')"
             cand=$((TPROXY_BASE + ssn + 1))
@@ -2004,6 +2305,7 @@ exit_del() {
     mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
     awk -F'|' -v n="$name" '$3!=n' "$BIND_CONF" > "$BIND_CONF.tmp" 2>/dev/null || :
     mv -f "$BIND_CONF.tmp" "$BIND_CONF"
+    logic_del_node "$name" 2>/dev/null || true
     ok "已删除 $name，相关绑定已解除"
     apply_all >/dev/null 2>&1
     pause_back
@@ -2067,7 +2369,7 @@ exit_test_one() {
                 printf '  %-14s %s不可用%s\n' "$name" "$RED" "$NC"
             fi
             ;;
-        ss|ss2022)
+        ss|ss2022|logic)
             local u port
             u="mr-ss-$(exit_fld "$l" 7).service"
             port="$(exit_ss_port "$name")"

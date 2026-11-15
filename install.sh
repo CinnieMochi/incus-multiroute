@@ -95,8 +95,19 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+# API 监听地址先定下来（默认只绑网桥网关），再启动服务，避免先绑 0.0.0.0
+if [ ! -f "$CONF_DIR/api.conf" ]; then
+    _GW="$(incus network list --format=csv 2>/dev/null | awk -F, '$2=="bridge"{print $1; exit}')"
+    [ -n "$_GW" ] || _GW="incusbr0"
+    _ADDR="$(ip -4 -o addr show dev "$_GW" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    printf 'LISTEN="%s:18988"\n' "${_ADDR:-0.0.0.0}" > "$CONF_DIR/api.conf"
+    info "API 监听地址: ${_ADDR:-0.0.0.0}:18988"
+fi
+
 systemctl daemon-reload
-if systemctl enable --now mr-api >/dev/null 2>&1; then
+systemctl enable mr-api >/dev/null 2>&1 || true
+# 用 restart 而不是 enable --now：后者对已运行的旧进程不生效，会继续绑着 0.0.0.0
+if systemctl restart mr-api >/dev/null 2>&1; then
     ok "API 服务已启动（开机自启）"
 else
     warn "API 服务启动失败，可稍后在菜单 [12] 手动处理"
