@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.6.0
+# Incus MultiRoute 宿主机出口管理脚本 v2.7.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -41,7 +41,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.7.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -136,7 +136,6 @@ init_main_conf() {
         echo "BRIDGE="$b""
         echo "SUBNET_GW="$gw""
         echo 'TPROXY_BASE="27000"'
-        echo "SINGBOX_BIN=\"$SINGBOX_BIN\""
         echo 'AUTO_GRANT=0'
         echo 'WG_PRIVATE_KEY=""'
         echo 'SS_CLIENT_CMD="/usr/local/bin/sing-box run"'
@@ -148,9 +147,12 @@ load_conf() {
     ensure_dirs
     init_main_conf
     . "$MAIN_CONF"
-    # 老版本 mr.conf 没有 SINGBOX_BIN，补进去，方便以后切换复用系统里的二进制
-    if ! grep -q '^SINGBOX_BIN=' "$MAIN_CONF" 2>/dev/null; then
-        printf 'SINGBOX_BIN="%s"\n' "${SINGBOX_BIN:-/usr/local/bin/sing-box}" >> "$MAIN_CONF"
+    # 本项目固定使用自己的一份 sing-box，不跟随系统/其它面板的那份
+    SINGBOX_BIN="/usr/local/bin/sing-box"
+    # 清掉旧版本引入的 SINGBOX_BIN 配置项（复用其它二进制已被移除）
+    if grep -q '^SINGBOX_BIN=' "$MAIN_CONF" 2>/dev/null; then
+        grep -v '^SINGBOX_BIN=' "$MAIN_CONF" > "$MAIN_CONF.tmp" && mv -f "$MAIN_CONF.tmp" "$MAIN_CONF"
+        info "已移除 mr.conf 里的 SINGBOX_BIN（本项目固定使用 /usr/local/bin/sing-box）"
     fi
     # 端口段从 41000 迁到 27000：避开常见业务号段，且用户端口映射撞号时能明确报占用
     if [ "$TPROXY_BASE" = "41000" ]; then
@@ -1061,20 +1063,6 @@ JSON
     return $rc
 }
 
-singbox_find_reusable() {
-    # 找系统里其它可用（且兼容）的 sing-box，供用户选择复用
-    local cand v
-    for cand in "$(command -v sing-box 2>/dev/null)" /usr/bin/sing-box /usr/local/bin/sing-box /opt/sing-box/sing-box; do
-        [ -n "$cand" ] || continue
-        [ "$cand" = "$SINGBOX_BIN" ] && continue
-        [ -x "$cand" ] || continue
-        singbox_probe "$cand" || continue
-        v="$("$cand" version 2>/dev/null | head -1)"
-        printf '%s|%s\n' "$cand" "$v"
-        return 0
-    done
-    return 1
-}
 
 wg_iface_count() {
     ip -o link show type wireguard 2>/dev/null | wc -l | tr -d ' '
@@ -1112,24 +1100,12 @@ install_singbox() {
         ok "本项目的 sing-box 已安装（$("$SINGBOX_BIN" version 2>/dev/null | head -1)），跳过"
         return 0
     fi
-    # 宿主机上可能已有别的 sing-box（面板/其它项目）：先看它能不能直接复用
-    local cand info_line reuse_path reuse_ver a
-    if info_line="$(singbox_find_reusable 2>/dev/null)"; then
-        reuse_path="${info_line%%|*}"; reuse_ver="${info_line#*|}"
-        warn "检测到系统里已有可用的 sing-box: $reuse_path（$reuse_ver）"
-        info "已通过兼容性自检：支持 tproxy 入站 + shadowsocks 2022 出站"
-        printf ' 是否直接复用它，不再单独装一份? [y/N]: '
-        read -r a
-        case "$a" in
-            [yY]*)
-                SINGBOX_BIN="$reuse_path"
-                save_main_var SINGBOX_BIN "$SINGBOX_BIN"
-                ok "已改用系统已有的 sing-box: $SINGBOX_BIN"
-                info "注意：这份二进制由别的程序管理，若它被升级/删除，本项目的出口会受影响"
-                return 0
-                ;;
-            *) info "选择自带一份：安装到 $SINGBOX_BIN（与系统里的互不影响）" ;;
-        esac
+    # 说明：本项目始终使用自己的一份（固定路径），不与系统里其它 sing-box 共用，
+    # 避免对方升级/覆写把我们的出口带崩
+    local other
+    other="$(command -v sing-box 2>/dev/null || true)"
+    if [ -n "$other" ] && [ "$other" != "$SINGBOX_BIN" ]; then
+        info "系统里另有 sing-box: $other（那是别的程序的，本项目不共用）"
     fi
     case "$(uname -m)" in
         x86_64)  arch="amd64" ;;
@@ -1166,7 +1142,12 @@ install_singbox() {
     if [ -z "$ver" ]; then
         err "sing-box 安装后无法运行"; return 1
     fi
-    ok "sing-box 安装完成（$ver）"
+    if singbox_probe "$SINGBOX_BIN"; then
+        ok "sing-box 安装完成（$ver），兼容性自检通过（tproxy + ss2022）"
+    else
+        warn "sing-box 已安装（$ver），但兼容性自检未通过：可能不支持 tproxy 或 ss2022"
+        info "请换一个官方 release 版本，或手动验证: $SINGBOX_BIN check"
+    fi
 }
 
 nftables_guard() {
