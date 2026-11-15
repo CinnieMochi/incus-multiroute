@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v2.5.1
+# Incus MultiRoute 宿主机出口管理脚本 v2.5.2
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -41,7 +41,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="2.5.1"
+SCRIPT_VERSION="2.5.2"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -115,7 +115,13 @@ ensure_dirs() {
     [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
     [ -f "$BIND_CONF" ]  || printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
     [ -f "$TOKEN_CONF" ] || { : > "$TOKEN_CONF"; chmod 600 "$TOKEN_CONF"; }
-    [ -f "$CONF_DIR/api.conf" ] || printf 'LISTEN="0.0.0.0:18988"\n' > "$CONF_DIR/api.conf"
+    if [ ! -f "$CONF_DIR/api.conf" ]; then
+        # 默认只绑网桥地址，避免 API 暴露到公网
+        local _gw
+        _gw="$(detect_gateway 2>/dev/null)"
+        [ -n "$_gw" ] || _gw="0.0.0.0"
+        printf 'LISTEN="%s:18988"\n' "$_gw" > "$CONF_DIR/api.conf"
+    fi
     [ -f "$CLIENT_ALLOW_CONF" ] || printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
 }
 
@@ -1029,7 +1035,7 @@ sync_timer_state() {
 # ---------------------------------------------------------------- 组件环境
 
 wg_installed()      { has_cmd wg; }
-singbox_installed() { has_cmd sing-box; }
+singbox_installed() { [ -x "$SINGBOX_BIN" ]; }
 
 wg_iface_count() {
     ip -o link show type wireguard 2>/dev/null | wc -l | tr -d ' '
@@ -1064,8 +1070,15 @@ install_wireguard() {
 install_singbox() {
     local arch url tmp bin ver
     if singbox_installed; then
-        ok "sing-box 已安装（$("$SINGBOX_BIN" version 2>/dev/null | head -1)），跳过"
+        ok "本项目的 sing-box 已安装（$("$SINGBOX_BIN" version 2>/dev/null | head -1)），跳过"
         return 0
+    fi
+    # 宿主机上可能已有别的 sing-box（面板/其它项目），它们不等于本项目能用的那份
+    local other
+    other="$(command -v sing-box 2>/dev/null || true)"
+    if [ -n "$other" ] && [ "$other" != "$SINGBOX_BIN" ]; then
+        warn "检测到系统里另有 sing-box: $other"
+        info "那是别的程序用的，本项目固定在 $SINGBOX_BIN 运行，互不影响"
     fi
     case "$(uname -m)" in
         x86_64)  arch="amd64" ;;
@@ -1675,7 +1688,9 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable shlii-egress-api >/dev/null 2>&1 || systemctl enable mr-api >/dev/null 2>&1 || true
+    systemctl enable mr-api >/dev/null 2>&1 || true
+    # 重启一次，确保按 api.conf 里的地址重新监听（旧进程可能还绑着 0.0.0.0）
+    systemctl restart mr-api >/dev/null 2>&1 || true
     ok "API 服务单元已写入并设为开机自启"
 }
 
