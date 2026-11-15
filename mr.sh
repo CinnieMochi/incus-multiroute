@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.1.0
+# Incus MultiRoute 宿主机出口管理脚本 v3.2.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -42,7 +42,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -489,9 +489,18 @@ logic_cfg_json() {  # $1=节点名 $2=本地端口 → 输出 sing-box 配置
         pass="$(printf '%s' "$line" | cut -d'|' -f7)"
         fam="$(printf '%s' "$line" | cut -d'|' -f8)"
         [ -n "$fam" ] || continue
+        local tp
+        tp="$(printf '%s' "$line" | cut -d'|' -f9)"
+        [ -n "$tp" ] && [ "$tp" != "auto" ] || tp="$fam"
         tag="m${idx}-${fam}"
-        if [ "$fam" = "v4" ]; then sv4=1; else sv6=1; fi
-        ob="{\"type\":\"shadowsocks\",\"tag\":\"$tag\",\"server\":\"$(json_esc "$host")\",\"server_port\":$port,\"method\":\"$(json_esc "$method")\",\"password\":\"$(json_esc "$pass")\",\"domain_resolver\":\"res-$fam\"}"
+        if [ "$tp" = "v4" ]; then sv4=1; else sv6=1; fi
+        local pn
+        pn="$(printf '%s' "$line" | cut -d'|' -f3)"
+        if [ "$pn" = "direct" ]; then
+            ob="{\"type\":\"direct\",\"tag\":\"$tag\"}"
+        else
+            ob="{\"type\":\"shadowsocks\",\"tag\":\"$tag\",\"server\":\"$(json_esc "$host")\",\"server_port\":$port,\"method\":\"$(json_esc "$method")\",\"password\":\"$(json_esc "$pass")\",\"domain_resolver\":\"res-$tp\"}"
+        fi
         if [ -z "$obs" ]; then obs="$ob"; else obs="$obs,$ob"; fi
         rule="{\"ip_version\":${fam#v},\"outbound\":\"$tag\"}"
         if [ -z "$rules" ]; then rules="$rule"; else rules="$rules,$rule"; fi
@@ -535,8 +544,17 @@ exit_add_logic() {
         idx=$((idx + 1))
         subline
         printf '  %s成员 %s%s\n' "$BLUE" "$idx" "$NC"
-        printf '协议: [1] Shadowsocks 2022（推荐）  [2] Shadowsocks（经典版）   （回车=1）: '; read -r ps
-        case "$ps" in 2) step="ss" ;; *) step="ss2022" ;; esac
+        printf '\n协议类型：\n'
+        printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
+        printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
+        printf '  %s[0]%s 返回上一步（重新输入节点名称）\n' "$YELLOW" "$NC"
+        printf '请输入 [0-2]（回车=1）: '
+        read -r ps
+        case "$ps" in
+            0) info "已返回上一步"; idx=$((idx - 1)); continue_outer=1; break ;;
+            2) step="ss" ;;
+            *) step="ss2022" ;;
+        esac
         if [ "$step" = "ss2022" ]; then
             methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
         else
@@ -2081,159 +2099,513 @@ api_listen_addr() {
 
 # ---------------------------------------------------------------- 出口菜单
 
-exit_add() {
-    local name proto host port method pass wgkey wgif local expect mark
-    local methods m msel i
+exit_edit() {
+    local f num name proto host port method pass mark wgkey wgif local expect enable lp
+    local field val reason methods m msel i
+    title "修改出口节点"
+    exits_print_numbered >/dev/null 2>&1
+    printf '  %-3s %-16s %-18s %-20s %-6s\n' "编号" "名称" "协议" "地址" "端口"
+    subline
+    exits_print_numbered | while read -r _; do :; done
+    exits_print_numbered
+    subline
+    printf '输入要修改的出口编号（0 返回）: '; read -r num
+    case "$num" in 0|"") return 0 ;; esac
+    case "$num" in *[!0-9]*) err "请输入编号"; pause_back; return 1 ;; esac
+    name="$(exits_list_plain | sed -n "${num}p" | cut -d'|' -f1)"
+    [ -n "$name" ] || { err "编号不存在"; pause_back; return 1; }
+    while :; do
+        f="$(exit_get "$name")"
+        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp <<< "$f"
+        title "修改：$name"
+        printf '  %-14s %s\n' "协议" "$(proto_label "$proto")"
+        printf '  %-14s %s\n' "地址" "${host:-(本机)}"
+        printf '  %-14s %s\n' "端口" "${port:-—}"
+        printf '  %-14s %s\n' "加密方式" "${method:-（不适用）}"
+        printf '  %-14s %s\n' "密码" "$([ -n "$pass" ] && echo '已设置（不显示）' || echo '未设置')"
+        printf '  %-14s %s\n' "期望出口 IP" "${expect:-—}"
+        printf '  %-14s %s\n' "指定本地端口" "${lp:-自动}"
+        printf '  %-14s %s\n' "状态" "$([ "$enable" = "0" ] && echo 停用 || echo 启用)"
+        subline
+        printf '    %s[1]%s 名称\n' "$GREEN" "$NC"
+        if [ "$proto" = "logic" ]; then
+            printf '    %s[2]%s 查看/修改成员\n' "$GREEN" "$NC"
+        else
+            printf '    %s[2]%s 服务器地址\n' "$GREEN" "$NC"
+            printf '    %s[3]%s 端口\n' "$GREEN" "$NC"
+            printf '    %s[4]%s 加密方式\n' "$GREEN" "$NC"
+            printf '    %s[5]%s 密码\n' "$GREEN" "$NC"
+        fi
+        printf '    %s[6]%s 期望出口 IP\n' "$GREEN" "$NC"
+        printf '    %s[7]%s 启用 / 停用\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
+        line
+        printf '请输入选项: '; read -r msel
+        case "$msel" in
+            0|"") return 0 ;;
+            1)
+                printf '新名称（0 返回）: '; read -r val
+                case "$val" in 0|"") continue ;; esac
+                exit_exists "$val" && [ "$val" != "$name" ] && { err "已有同名出口"; continue; }
+                edit_exit_field "$name" 1 "$val" || continue
+                # 绑定表里的出口名一起改
+                [ -f "$BIND_CONF" ] && { awk -F'|' -v OFS='|' -v o="$name" -v n="$val" '$3==o{$3=n} {print}' "$BIND_CONF" > "$BIND_CONF.tmp" && mv -f "$BIND_CONF.tmp" "$BIND_CONF"; }
+                info "名称已改为 $val（用户端 out list 会显示新名称）"
+                name="$val"
+                edit_apply_changes
+                ;;
+            2)
+                if [ "$proto" = "logic" ]; then exit_edit_members "$name"; continue; fi
+                printf '新服务器地址（0 返回）: '; read -r val
+                case "$val" in 0|"") continue ;; esac
+                case "$val" in \[*\]) val="$(printf '%s' "$val" | tr -d '[]')" ;; esac
+                edit_exit_field "$name" 3 "$val" || continue
+                edit_apply_changes
+                ;;
+            3)
+                [ "$proto" = "logic" ] && { echo "无效选择"; sleep 1; continue; }
+                printf '新端口（0 返回）: '; read -r val
+                case "$val" in 0|"") continue ;; esac
+                case "$val" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
+                edit_exit_field "$name" 4 "$val" || continue
+                edit_apply_changes
+                ;;
+            4)
+                [ "$proto" = "logic" ] && { echo "无效选择"; sleep 1; continue; }
+                if [ "$proto" = "ss2022" ]; then
+                    methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+                elif [ "$proto" = "ss" ]; then
+                    methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+                else
+                    info "WireGuard 的加密方式固定，不能修改"; pause_back; continue
+                fi
+                i=1; for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+                printf '  %s[0]%s 返回\n' "$YELLOW" "$NC"
+                printf '请选择 [0-%s]: ' "$((i - 1))"; read -r msel
+                case "$msel" in 0|"") continue ;; esac
+                case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
+                val="$(printf '%s\n' $methods | sed -n "${msel}p")"
+                [ -n "$val" ] || { err "无效选择"; continue; }
+                edit_exit_field "$name" 5 "$val" || continue
+                warn "加密方式变了，密码通常也要一起改（[5]）"
+                edit_apply_changes
+                ;;
+            5)
+                [ "$proto" = "logic" ] && { echo "无效选择"; sleep 1; continue; }
+                while :; do
+                    printf '新密码（0 返回）: '; read -r val
+                    case "$val" in 0|"") break ;; esac
+                    if [ "$proto" = "ss2022" ]; then
+                        if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
+                            err "密码不符合 $method 的格式：$reason"; continue
+                        fi
+                    fi
+                    edit_exit_field "$name" 6 "$val" && edit_apply_changes
+                    break
+                done
+                ;;
+            6)
+                printf '新期望出口 IP（留空=用服务器地址，0 返回）: '; read -r val
+                case "$val" in 0) continue ;; esac
+                [ -n "$val" ] || val="$host"
+                edit_exit_field "$name" 11 "$val" || continue
+                ok "已保存（这一项只用于显示与核对，不需要重启）"
+                ;;
+            7)
+                exit_set_enable "$name" "$([ "$enable" = "0" ] && echo 1 || echo 0)"
+                apply_all
+                ok "状态已切换并重新下发"
+                pause_back
+                ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+edit_apply_changes() {
+    info "正在重新下发（该出口的 sing-box 会自动重启）..."
+    apply_all
+    info "用户端无需重新授权；out list 只显示出口名，改地址/端口/密码对用户透明"
+    pause_back
+}
+
+edit_exit_field() {  # $1=出口名 $2=字段号 $3=新值
+    local name="$1" fn="$2" val="$3" line a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13
+    [ -f "$EXITS_CONF" ] || return 1
+    : > "$EXITS_CONF.tmp"
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) printf '%s\n' "$line" >> "$EXITS_CONF.tmp"; continue ;; esac
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 <<< "$line"
+        if [ "$a1" = "$name" ]; then
+            case "$fn" in
+                1) a1="$val" ;;
+                3) a3="$val" ;;
+                4) a4="$val" ;;
+                5) a5="$val" ;;
+                6) a6="$val" ;;
+                11) a11="$val" ;;
+                12) a12="$val" ;;
+                13) a13="$val" ;;
+            esac
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$a12" "$a13" >> "$EXITS_CONF.tmp"
+        else
+            printf '%s\n' "$line" >> "$EXITS_CONF.tmp"
+        fi
+    done < "$EXITS_CONF"
+    mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
+}
+
+edit_logic_member_field() {  # $1=节点名 $2=成员序号 $3=字段号(4..8) $4=新值
+    local node="$1" midx="$2" fn="$3" val="$4" line a1 a2 a3 a4 a5 a6 a7 a8 a9
+    [ -f "$LOGIC_CONF" ] || return 1
+    : > "$LOGIC_CONF.tmp"
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) printf '%s\n' "$line" >> "$LOGIC_CONF.tmp"; continue ;; esac
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 <<< "$line"
+        if [ "$a1" = "$node" ] && [ "$a2" = "$midx" ]; then
+            case "$fn" in
+                4) a4="$val" ;;
+                5) a5="$val" ;;
+                6) a6="$val" ;;
+                7) a7="$val" ;;
+                8) a8="$val" ;;
+                9) a9="$val" ;;
+            esac
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" >> "$LOGIC_CONF.tmp"
+        else
+            printf '%s\n' "$line" >> "$LOGIC_CONF.tmp"
+        fi
+    done < "$LOGIC_CONF"
+    mv -f "$LOGIC_CONF.tmp" "$LOGIC_CONF"
+}
+
+exit_edit_members() {  # $1=节点名
+    local node="$1" num midx proto host port method pass fam tp val reason methods m msel i
+    while :; do
+        title "成员管理：$node"
+        printf '  %-4s %-18s %-6s %-6s %-22s\n' "序号" "协议" "出站" "接入" "地址"
+        subline
+        while IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9; do
+            case "$a1" in ''|'#'*) continue ;; esac
+            [ "$a1" = "$node" ] || continue
+            printf '  %-4s %-18s %-6s %-6s %-22s\n' "$a2" "$(proto_label "$a3")" "$a8" "${a9:-auto}" "$([ "$a3" = direct ] && echo 本机直出 || echo "${a4:-—}:${a5:-—}")"
+        done < "$LOGIC_CONF"
+        subline
+        printf '输入成员序号修改（0 返回）: '; read -r num
+        case "$num" in 0|"") return 0 ;; esac
+        midx="$num"
+        local ml
+        ml="$(awk -F'|' -v n="$node" -v i="$midx" '$1==n && $2==i' "$LOGIC_CONF" 2>/dev/null | head -1)"
+        [ -n "$ml" ] || { err "没有这个成员"; pause_back; continue; }
+        IFS='|' read -r _ proto host port method pass fam tp <<< "$ml"
+        if [ "$proto" = "direct" ]; then
+            info "本机直出成员，没有可改的字段（地址/端口/密码都不用填）"
+            pause_back; continue
+        fi
+        printf '    %s[1]%s 地址（当前 %s）\n' "$GREEN" "$NC" "$host"
+        printf '    %s[2]%s 端口（当前 %s）\n' "$GREEN" "$NC" "$port"
+        printf '    %s[3]%s 加密方式（当前 %s）\n' "$GREEN" "$NC" "$method"
+        printf '    %s[4]%s 密码（已设置则不显示）\n' "$GREEN" "$NC"
+        printf '    %s[5]%s 出站家族（当前 %s）\n' "$GREEN" "$NC" "$fam"
+        printf '    %s[6]%s 接入家族（当前 %s）\n' "$GREEN" "$NC" "${tp:-auto}"
+        printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
+        printf '请选择: '; read -r msel
+        case "$msel" in
+            0|"") continue ;;
+            1) printf '新地址（0 返回）: '; read -r val
+               case "$val" in 0|"") continue ;; esac
+               edit_logic_member_field "$node" "$midx" 4 "$val" ;;
+            2) printf '新端口（0 返回）: '; read -r val
+               case "$val" in 0|"") continue ;; esac
+               case "$val" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
+               edit_logic_member_field "$node" "$midx" 5 "$val" ;;
+            3) if [ "$proto" = "ss2022" ]; then
+                   methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+               else
+                   methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+               fi
+               i=1; for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+               printf '请选择 [1-%s]: ' "$((i - 1))"; read -r msel
+               val="$(printf '%s\n' $methods | sed -n "${msel}p")"
+               [ -n "$val" ] || { err "无效选择"; continue; }
+               edit_logic_member_field "$node" "$midx" 6 "$val" ;;
+            4) while :; do
+                   printf '新密码（0 返回）: '; read -r val
+                   case "$val" in 0|"") break ;; esac
+                   if [ "$proto" = "ss2022" ]; then
+                       if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
+                           err "密码不符合 $method 的格式：$reason"; continue
+                       fi
+                   fi
+                   edit_logic_member_field "$node" "$midx" 7 "$val"; break
+               done ;;
+            5) printf '出站家族 [1] IPv4 [2] IPv6（0 返回）: '; read -r val
+               case "$val" in 0|"") continue ;; 2) val="v6" ;; 1) val="v4" ;; *) continue ;; esac
+               edit_logic_member_field "$node" "$midx" 8 "$val" ;;
+            6) printf '接入家族 [1] IPv4 [2] IPv6 [3] 与出站相同（0 返回）: '; read -r val
+               case "$val" in 0|"") continue ;; 1) val="v4" ;; 2) val="v6" ;; 3) val="auto" ;; *) continue ;; esac
+               edit_logic_member_field "$node" "$midx" 9 "$val" ;;
+            *) echo "无效选择"; sleep 1; continue ;;
+        esac
+        info "正在重新下发 ..."
+        apply_all
+        pause_back
+    done
+}
+
+exit_add_extend() {
+    # 本机某个家族只能直出时，用远端节点补另一个家族，凑成双栈出口
+    local b6 g4 g6 localfam remfam name proto method pass host port m msel methods i reason mark expect
     clear_if_tty
-    title "新增出口节点"
-    printf '协议类型：\n'
-    printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
-    printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
-    printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
-    printf '  %s[4]%s 逻辑节点（用多台机器拼一个 IPv4 + IPv6 出口）\n' "$GREEN" "$NC"
-    printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
-    printf '请输入 [0-4]: '
-    read -r proto_sel
-    case "$proto_sel" in
-        1) proto="ss2022" ;;
-        2) proto="ss" ;;
-        3) proto="wg" ;;
-        4) proto="logic"; exit_add_logic; return $? ;;
-        0|"") info "已取消"; return 0 ;;
-        *) err "无效选择"; pause_back; return 1 ;;
-    esac
-
-    # 依赖前置检查：缺客户端就不再往下问
-    case "$proto" in
-        ss|ss2022|logic)
-            if ! singbox_installed; then
-                err "还没有安装 sing-box（Shadowsocks / Shadowsocks 2022 客户端）"
-                info "请先到 菜单 [14] → [3] 安装，装完再回来新增 $proto 出口"
-                info "或在 菜单 [14] → [4] 一次装齐所有依赖"
-                pause_back
-                return 1
-            fi
-            ;;
-        wg)
-            if ! wg_installed; then
-                err "还没有安装 wireguard-tools"
-                info "请先到 菜单 [14] → [2] 安装，装完再回来新增 WireGuard 出口"
-                info "或在 菜单 [14] → [4] 一次装齐所有依赖"
-                pause_back
-                return 1
-            fi
-            ;;
-    esac
-
-    printf '名称（如 香港-01，输入 0 返回）: '; read -r name
-    case "$name" in 0|"") info "已取消"; return 0 ;; esac
-    [ -n "$name" ] || { err "名称不能为空"; pause_back; return 1; }
-    exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
-
-    printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回）: '; read -r host
-    case "$host" in 0|"") info "已取消"; return 0 ;; esac
-    case "$host" in
-        \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;;
-    esac
-    case "$host" in
-        *:*)
-            warn "这是一个 IPv6 地址：宿主机必须已有可用的 IPv6 出网，否则该出口无法连接"
-            info "容器侧仍然是 IPv4（10.10.0.0/22），只有宿主机到落地机这一段走 IPv6"
-            ;;
-    esac
-
-    if [ "$proto" = "wg" ]; then
-        info "WireGuard 的加密算法是协议固定的（ChaCha20-Poly1305），无需选择"
-        printf '端口 [51820]: '; read -r port; [ -n "$port" ] || port=51820
-        ensure_wg_key || { pause_back; return 1; }
-        printf '出口机公钥（输入 0 返回）: '; read -r wgkey
-        case "$wgkey" in 0|"") info "已取消"; return 0 ;; esac
-        printf '本机接口名 [wg-exit1]: '; read -r wgif; [ -n "$wgif" ] || wgif="wg-exit$(($(exits_count) + 1))"
-        printf '本机隧道地址（如 10.200.1.2/32，输入 0 返回）: '; read -r local
-        case "$local" in 0|"") info "已取消"; return 0 ;; esac
-        method=""; pass=""
+    title "IPv4 / IPv6 拓展"
+    b6="$(bridge_ipv6 2>/dev/null)"
+    g4=0; g6=0
+    ip -4 route show default 2>/dev/null | grep -q default && g4=1
+    ip -6 route show default 2>/dev/null | grep -q default && g6=1
+    printf '  %-22s %s\n' "宿主机 IPv4 出网" "$([ "$g4" = 1 ] && echo 有 || echo 无)"
+    printf '  %-22s %s\n' "宿主机 IPv6 出网" "$([ "$g6" = 1 ] && echo 有 || echo 无)"
+    printf '  %-22s %s\n' "网桥 IPv6" "${b6:-未启用}"
+    subline
+    if [ -z "$b6" ]; then
+        err "网桥没有 IPv6 地址，容器就不会有 IPv6 流量，拓展没有意义"
+        info "先用这条命令给网桥开一段 ULA（不占用公网地址）："
+        info "  incus network set incusbr0 ipv6.address fd42:1:1::1/64"
+        info "  incus network set incusbr0 ipv6.nat true"
+        pause_back; return 1
+    fi
+    if [ "$g4" = "1" ] && [ "$g6" = "1" ]; then
+        info "本机已是双栈，直接新增普通出口即可，不需要拓展"
+        pause_back; return 1
+    fi
+    if [ "$g4" = "1" ]; then
+        localfam="v4"; remfam="v6"
+        info "本机有 IPv4：IPv4 走本机直出，需要远端节点补 IPv6 出站"
     else
+        localfam="v6"; remfam="v4"
+        info "本机只有 IPv6：IPv6 走本机直出，需要远端节点补 IPv4 出站"
+    fi
+    subline
+    printf '节点名称（如 双栈-拓展，输入 0 取消）: '; read -r name
+    case "$name" in 0|"") info "已取消"; return 0 ;; esac
+    exit_exists "$name" && { err "出口已存在: $name"; pause_back; return 1; }
+    while :; do
+        printf '\n远端节点协议：\n'
+        printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
+        printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
+        printf '  %s[0]%s 返回上一步（重新输入节点名称）\n' "$YELLOW" "$NC"
+        printf '请输入 [0-2]（回车=1）: '
+        read -r msel
+        case "$msel" in
+            0) info "已返回节点名称输入"
+               printf '节点名称: '; read -r name
+               case "$name" in 0|"") info "已取消"; return 0 ;; esac
+               continue ;;
+            2) proto="ss" ;;
+            *) proto="ss2022" ;;
+        esac
         if [ "$proto" = "ss2022" ]; then
             methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
-            printf '\n加密方式（Shadowsocks 2022）：\n'
         else
             methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
-            printf '\n加密方式（Shadowsocks 经典版）：\n'
         fi
+        printf '加密方式：\n'
         i=1
-        for m in $methods; do
-            printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"
-            i=$((i + 1))
-        done
-        printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
-        printf '请输入 [0-%s]: ' "$((i - 1))"
+        for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+        printf '  %s[0]%s 返回上一步（重新选协议）\n' "$YELLOW" "$NC"
+        printf '请选择 [0-%s]: ' "$((i - 1))"
         read -r msel
-        case "$msel" in 0|"") info "已取消"; return 0 ;; esac
-        case "$msel" in *[!0-9]*) err "请输入序号"; pause_back; return 1 ;; esac
+        case "$msel" in 0|"") continue ;; esac
+        case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
         method="$(printf '%s\n' $methods | sed -n "${msel}p")"
-        [ -n "$method" ] || { err "无效选择"; pause_back; return 1; }
-
-        printf '端口 [2525]: '; read -r port; [ -n "$port" ] || port=2525
+        [ -n "$method" ] || { err "无效选择"; continue; }
+        printf '服务器地址（输入 0 返回上一步）: '; read -r host
+        case "$host" in 0|"") continue ;; esac
+        printf '端口（输入 0 返回上一步）: '; read -r port
+        case "$port" in 0|"") continue ;; esac
+        case "$port" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
         while :; do
-            printf '密码（输入 0 返回）: '; read -r pass
-            case "$pass" in 0|"") info "已取消"; return 0 ;; esac
+            printf '密码（输入 0 返回上一步）: '; read -r pass
+            case "$pass" in 0|"") break ;; esac
             if [ "$proto" = "ss2022" ]; then
                 if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
                 err "密码不符合 $method 的格式：$reason"
-                info "单密钥示例: $(printf '%*s' 16 '' | tr ' ' 'A' | base64 -w0)"
-                info "双密钥示例: 两段各自 base64 后用 : 连接"
                 continue
             fi
-            reason="$(ss_classic_pass_check "$pass")" || { err "$reason"; continue; }
             break
         done
-        wgkey=""; wgif=""; local=""
-    fi
-
-    printf '期望出口 IP（留空用服务器地址，输入 0 返回）: '; read -r expect
+        [ -n "$pass" ] || continue
+        break
+    done
+    printf '期望出口 IP（可留空，输入 0 取消整个节点）: '; read -r expect
     case "$expect" in 0) info "已取消"; return 0 ;; esac
-    [ -n "$expect" ] || expect="$host"
     mark="$(mark_next)"
-    # ss 出口独占一个本地代理端口：默认按序号分配，被占用时只给新出口单独指定端口，
-    # 老出口保持原端口不动（不会重启、不会断线）
-    local lp=""
-    case "$proto" in
-        ss|ss2022|logic)
-            local cand owner np ssn
-            ssn="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' '$2=="ss"||$2=="ss2022"{n++} END{print n+0}')"
-            cand=$((TPROXY_BASE + ssn + 1))
-            if [ "$cand" -gt "$((TPROXY_BASE + 99))" ]; then
-                err "端口段 $TPROXY_BASE-$((TPROXY_BASE + 99)) 已用尽"
-                info "请在 mr.conf 里把 TPROXY_BASE 改大后重试"
-                pause_back; return 1
-            fi
-            owner="$(port_owner "$cand" 2>/dev/null)"
-            case "$owner" in
-                ""|*sing-box*) ;;
-                *)
-                    warn "默认端口 $cand 已被占用（$owner）"
-                    info "老出口不受影响，只给这个新出口指定一个本地端口"
-                    while :; do
-                        printf ' 新出口本地端口（留空取消）: '; read -r np
-                        case "$np" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
-                        case "$np" in *[!0-9]*) err "请输入数字"; continue ;; esac
-                        if [ "$np" -lt 1024 ] || [ "$np" -gt 65535 ]; then err "端口范围 1024-65535"; continue; fi
-                        if [ -n "$(port_owner "$np" 2>/dev/null)" ]; then warn "$np 也被占用，换一个"; continue; fi
-                        if grep -q "|$np\$" "$EXITS_CONF" 2>/dev/null; then warn "$np 已被其它出口使用"; continue; fi
-                        lp="$np"; break
-                    done
-                    ;;
-            esac
-            ;;
-    esac
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" "$lp" >> "$EXITS_CONF"
-    ok "已新增出口 $name（$proto / $method，mark $mark）"
-    info "正在自动下发规则（ss 出口会立即启动 sing-box）..."
+    # 成员 1：本机直出（占 localfam 槽）；成员 2：远端节点（占 remfam 槽，走 localfam 接入）
+    printf '%s|1|direct||0|||%s|auto\n' "$name" "$localfam" >> "$LOGIC_CONF"
+    printf '%s|2|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$remfam" "$localfam" >> "$LOGIC_CONF"
+    printf '%s|logic||0|||%s||||%s|1|\n' "$name" "$mark" "$expect" >> "$EXITS_CONF"
+    ok "已新增拓展节点 $name（$(proto_label "$proto") 补 $remfam，mark $mark）"
+    info "IPv$([ "$localfam" = v4 ] && echo 4 || echo 6) 目标走本机直出；IPv$([ "$remfam" = v4 ] && echo 4 || echo 6) 目标走远端节点"
+    info "正在下发规则 ..."
     apply_all
     pause_back
 }
 
-# ---------------------------------------------------------------- 编号选择辅助
+exit_add() {
+    local name proto host port method pass wgkey wgif local expect mark lp reason
+    local methods m msel i proto_sel step="proto" owner np cand ssn
+    clear_if_tty
+    title "新增出口节点"
+    while :; do
+        case "$step" in
+        proto)
+            printf '协议类型：\n'
+            printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
+            printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
+            printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
+            printf '  %s[4]%s 逻辑节点（多台机器拼 IPv4 + IPv6）\n' "$GREEN" "$NC"
+            printf '  %s[5]%s IPv4 / IPv6 拓展（本机直出 + 远端补另一个家族）\n' "$GREEN" "$NC"
+            printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
+            printf '请输入 [0-5]: '
+            read -r proto_sel || return 0
+            case "$proto_sel" in
+                0|"") info "已取消"; return 0 ;;
+                1) proto="ss2022" ;;
+                2) proto="ss" ;;
+                3) proto="wg" ;;
+                4) exit_add_logic; return $? ;;
+                5) exit_add_extend; return $? ;;
+                *) err "无效选择"; sleep 1; continue ;;
+            esac
+            case "$proto" in
+                ss|ss2022) singbox_installed || {
+                        err "还没有安装 sing-box（Shadowsocks / Shadowsocks 2022 客户端）"
+                        info "请先到菜单 [14] → [3] 安装"; pause_back; return 1; } ;;
+                wg) wg_installed || {
+                        err "还没有安装 wireguard-tools"
+                        info "请先到菜单 [14] → [2] 安装"; pause_back; return 1; } ;;
+            esac
+            step="name"
+            ;;
+        name)
+            printf '名称（如 香港-01，输入 0 返回上一步）: '; read -r name
+            case "$name" in 0|"") info "已返回协议选择"; step="proto"; continue ;; esac
+            exit_exists "$name" && { err "出口已存在: $name"; continue; }
+            step="host"
+            ;;
+        host)
+            printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回上一步）: '; read -r host
+            case "$host" in 0|"") info "已返回名称输入"; step="name"; continue ;; esac
+            case "$host" in \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;; esac
+            case "$host" in
+                *:*) warn "这是 IPv6 地址：宿主机必须已有可用的 IPv6 出网，否则连不上" ;;
+            esac
+            if [ "$proto" = "wg" ]; then step="wgport"; else step="method"; fi
+            ;;
+        method)
+            if [ "$proto" = "ss2022" ]; then
+                methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
+                printf '\n加密方式（Shadowsocks 2022）：\n'
+            else
+                methods="aes-256-gcm aes-192-gcm aes-128-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305"
+                printf '\n加密方式（Shadowsocks 经典版）：\n'
+            fi
+            i=1
+            for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
+            printf '  %s[0]%s 返回上一步（重新输入服务器地址）\n' "$YELLOW" "$NC"
+            printf '请输入 [0-%s]: ' "$((i - 1))"
+            read -r msel
+            case "$msel" in 0|"") info "已返回服务器地址"; step="host"; continue ;; esac
+            case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
+            method="$(printf '%s\n' $methods | sed -n "${msel}p")"
+            [ -n "$method" ] || { err "无效选择"; continue; }
+            step="port"
+            ;;
+        port)
+            printf '端口（输入 0 返回上一步）: '
+            read -r port
+            case "$port" in 0|"") info "已返回上一步"; step="method"; continue ;; esac
+            [ -n "$port" ] || port=$([ "$proto" = "wg" ] && echo 51820 || echo 2525)
+            case "$port" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
+            if [ "$proto" = "wg" ]; then step="wgkey"; else step="password"; fi
+            ;;
+        password)
+            printf '密码（输入 0 返回上一步）: '; read -r pass
+            case "$pass" in 0|"") info "已返回端口输入"; step="port"; continue ;; esac
+            if [ "$proto" = "ss2022" ]; then
+                if reason="$(ss2022_pass_check "$method" "$pass")"; then :; else
+                    err "密码不符合 $method 的格式：$reason"
+                    info "单密钥示例: $(printf '%*s' 16 '' | tr ' ' 'A' | base64 -w0)"
+                    info "双密钥示例: 两段各自 base64 后用 : 连接"
+                    continue
+                fi
+            else
+                reason="$(ss_classic_pass_check "$pass")" || { err "$reason"; continue; }
+            fi
+            step="expect"
+            ;;
+        wgport)
+            printf '端口 [51820]（输入 0 返回上一步）: '; read -r port
+            case "$port" in 0|"") info "已返回服务器地址"; step="host"; continue ;; esac
+            [ -n "$port" ] || port=51820
+            step="wgkey"
+            ;;
+        wgkey)
+            ensure_wg_key || { pause_back; return 1; }
+            printf '出口机公钥（输入 0 返回上一步）: '; read -r wgkey
+            case "$wgkey" in 0|"") info "已返回端口输入"; step="wgport"; continue ;; esac
+            step="wgif"
+            ;;
+        wgif)
+            printf '本机接口名 [wg-exitN]（输入 0 返回上一步）: '; read -r wgif
+            case "$wgif" in 0|"") info "已返回出口机公钥"; step="wgkey"; continue ;; esac
+            [ -n "$wgif" ] || wgif="wg-exit$(($(exits_count) + 1))"
+            step="wglocal"
+            ;;
+        wglocal)
+            printf '本机隧道地址（如 10.200.1.2/32，输入 0 返回上一步）: '; read -r local
+            case "$local" in 0|"") info "已返回接口名"; step="wgif"; continue ;; esac
+            method=""; pass=""
+            step="expect"
+            ;;
+        expect)
+            printf '期望出口 IP（留空=服务器地址，输入 0 返回上一步）: '; read -r expect
+            case "$expect" in 0) info "已返回上一步"; step=$([ "$proto" = "wg" ] && echo wglocal || echo password); continue ;; esac
+            [ -n "$expect" ] || expect="$host"
+            mark="$(mark_next)"
+            lp=""
+            case "$proto" in
+                ss|ss2022)
+                    ssn="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' '$2=="ss"||$2=="ss2022"{n++} END{print n+0}')"
+                    cand=$((TPROXY_BASE + ssn + 1))
+                    owner="$(port_owner "$cand" 2>/dev/null)"
+                    case "$owner" in
+                        ""|*sing-box*) ;;
+                        *)
+                            warn "默认端口 $cand 已被占用（$owner）"
+                            info "老出口不受影响，只给这个新出口指定一个本地端口"
+                            while :; do
+                                printf ' 新出口本地端口（留空取消）: '; read -r np
+                                case "$np" in ''|0) info "已取消，未做任何改动"; return 0 ;; esac
+                                case "$np" in *[!0-9]*) err "请输入数字"; continue ;; esac
+                                if [ "$np" -lt 1024 ] || [ "$np" -gt 65535 ]; then err "端口范围 1024-65535"; continue; fi
+                                if [ -n "$(port_owner "$np" 2>/dev/null)" ]; then warn "$np 也被占用，换一个"; continue; fi
+                                if grep -q "|$np\$" "$EXITS_CONF" 2>/dev/null; then warn "$np 已被其它出口使用"; continue; fi
+                                lp="$np"; break
+                            done
+                            ;;
+                    esac
+                    ;;
+            esac
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" "$lp" >> "$EXITS_CONF"
+            ok "已新增出口 $name（$(proto_label "$proto")，mark $mark）"
+            info "正在自动下发规则 ..."
+            apply_all
+            pause_back
+            return 0
+            ;;
+        esac
+    done
+}
 
 exit_set_enable() {
     # $1=出口名 $2=1/0
@@ -2650,6 +3022,7 @@ menu_main() {
         printf '    %s[2]%s 新增出口节点\n' "$GREEN" "$NC"
         printf '    %s[3]%s 删除出口节点\n' "$GREEN" "$NC"
         printf '    %s[4]%s 测试出口连通性\n' "$GREEN" "$NC"
+        printf '    %s[17]%s 修改出口节点\n' "$GREEN" "$NC"
         printf '  %s【容器绑定】%s\n' "$CYAN" "$NC"
         printf '    %s[5]%s 容器列表（含当前出口）\n' "$GREEN" "$NC"
         printf '    %s[6]%s 绑定容器到出口\n' "$GREEN" "$NC"
@@ -2670,7 +3043,7 @@ menu_main() {
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
         line
-        printf '请输入选项 [0-16 / 99]: '
+        printf '请输入选项 [0-17 / 99]: '
         read -r choice || exit 0
         case "$choice" in
             1) exits_list ;;
@@ -2689,6 +3062,7 @@ menu_main() {
             14) deps_menu ;;
             15) update_menu ;;
             16) sec_menu ;;
+            17) exit_edit ;;
             99) uninstall_all ;;
             0) printf '%s再见%s\n' "$YELLOW" "$NC"; exit 0 ;;
             *) echo "无效选择"; sleep 1 ;;
