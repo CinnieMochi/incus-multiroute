@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.0.0
+# Incus MultiRoute 宿主机出口管理脚本 v3.0.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -42,7 +42,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -1935,6 +1935,18 @@ doctor() {
         [ "$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)" = "0" ] \
             && check_item "br_netfilter(IPv6) 已关闭" 0 "双栈必需" \
             || printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter(IPv6) 未关闭" "v6 tproxy 会不通，按 10 重新下发"
+    fi
+    if [ -z "$b6" ] && [ -f "$BIND_CONF" ]; then
+        # 网桥没 IPv6，但容器自己另有 IPv6（例如单独的 routed 网卡）：这部分流量不会被代理
+        local _c _ip _e _m v6leak=""
+        while IFS='|' read -r _c _ip _e _m; do
+            case "$_c" in ''|'#'*) continue ;; esac
+            [ -n "$(container_ip6 "$_c" 2>/dev/null)" ] && v6leak="$v6leak $_c"
+        done < "$BIND_CONF"
+        if [ -n "$v6leak" ]; then
+            printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "容器有 IPv6 但网桥没有" "$v6leak"
+            info "这部分 IPv6 流量不经过网桥，不会被代理（如需代理请给网桥配 IPv6，或禁用容器 IPv6）"
+        fi
     fi
     if ip -6 route show default 2>/dev/null | grep -q default; then
         printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "宿主机有 IPv6 出网" "可用于 IPv6 成员/出口"
