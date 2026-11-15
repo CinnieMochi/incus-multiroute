@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.2.1
+# Incus MultiRoute 宿主机出口管理脚本 v3.3.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -42,7 +42,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.2.1"
+SCRIPT_VERSION="3.3.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -535,7 +535,7 @@ exit_add_logic() {
     info "每一步输入 0 都可以返回上一步"
     if ! singbox_installed; then
         err "还没有安装 sing-box（逻辑节点依赖它）"
-        info "请先到菜单 [14] → [3] 安装"
+        info "请先到菜单 [15] → [3] 安装"
         pause_back; return 1
     fi
     while :; do
@@ -559,7 +559,7 @@ exit_add_logic() {
                     printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
                     printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
                     printf '请输入 [0-2]（回车=1）: '
-                    read -r ps
+                    read -r ps || return 0
                     case "$ps" in
                         0)
                             if [ "$idx" -le 1 ]; then
@@ -584,7 +584,7 @@ exit_add_logic() {
                     for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
                     printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
                     printf '请选择 [0-%s]: ' "$((i - 1))"
-                    read -r msel
+                    read -r msel || return 0
                     case "$msel" in
                         0) st="proto"; continue ;;
                         ''|*[!0-9]*) err "请输入数字"; continue ;;
@@ -744,9 +744,9 @@ wg_table() {
 ensure_wg_key() {
     local k pub a
     [ -n "$WG_PRIVATE_KEY" ] && return 0
-    has_cmd wg || { err "需要先安装 wireguard-tools（菜单 14 -> 2）"; return 1; }
+    has_cmd wg || { err "需要先安装 wireguard-tools（菜单 15 -> 2）"; return 1; }
     printf ' 尚未生成宿主机 WireGuard 私钥，现在生成? [Y/n]: '
-    read -r a
+    read -r a || return 0
     case "$a" in [nN]) err "已取消"; return 1 ;; esac
     k="$(wg genkey 2>/dev/null)"
     [ -n "$k" ] || { err "生成失败"; return 1; }
@@ -1209,7 +1209,7 @@ client_grant_all() {
     info "容器: $preview$([ "$n" -gt 6 ] && echo '...')"
     subline
     printf ' 输入 yes 继续，其它任意键取消: '
-    read -r a
+    read -r a || return 0
     case "$a" in
         [yY][eE][sS]) ;;
         *) info "已取消，未做任何改动"; pause_back; return 0 ;;
@@ -1239,7 +1239,7 @@ client_revoke_all() {
     info "名单: $(printf '%s ' $list)"
     subline
     printf ' 输入 yes 继续，其它任意键取消: '
-    read -r a
+    read -r a || return 0
     case "$a" in
         [yY][eE][sS]) ;;
         *) info "已取消，未做任何改动"; pause_back; return 0 ;;
@@ -1259,7 +1259,7 @@ client_revoke_all() {
 
 client_push_one() {
     local name="$1" tok tmp
-    [ -f "$CLIENT_BASE" ] || { err "缺少基准脚本 $CLIENT_BASE（先在菜单 15 安装本脚本）"; return 1; }
+    [ -f "$CLIENT_BASE" ] || { err "缺少基准脚本 $CLIENT_BASE（先在菜单 14 安装本脚本）"; return 1; }
     incus file push "$CLIENT_BASE" "$name/usr/local/bin/out" --mode 0755 --create-dirs >/dev/null 2>&1 || {
         err "$name: 推送 out 失败"; return 1; }
     tok="$(token_of "$name")"
@@ -1309,7 +1309,7 @@ client_sync() {
         fi
         title "下发用户端 out"
         warn "当前没有任何已授权用户，未做任何下发"
-        info "如需给某用户开通：菜单 [9] -> [3] 授权并下发"
+        info "如需给某用户开通：菜单 [10] -> [3] 授权并下发"
         pause_back
         return 0
     fi
@@ -1350,7 +1350,7 @@ sync_timer_on() {
     fi
     info "当前间隔: $(sync_timer_interval)"
     printf ' 请输入校验间隔（分钟，最小 5，直接回车用 10）: '
-    read -r m
+    read -r m || return 0
     case "$m" in
         ""|0) m=10 ;;
         *[!0-9]*) err "请输入数字"; return 1 ;;
@@ -1380,7 +1380,7 @@ AccuracySec=30s
 WantedBy=timers.target
 EOF
     printf ' 是否自动授权并下发「新创建的容器」? [Y/n]: '
-    read -r ag
+    read -r ag || return 0
     case "$ag" in
         [nN]) save_main_var AUTO_GRANT 0; AUTO_GRANT=0; info "已关闭自动授权：新容器需要手动 [2] 授权" ;;
         *)    save_main_var AUTO_GRANT 1; AUTO_GRANT=1; ok "已开启自动授权：定时器每次运行都会把新容器纳管并下发 out" ;;
@@ -1531,7 +1531,7 @@ nftables_guard() {
     warn "检测到 nftables.service 已启用，且 /etc/nftables.conf 含 flush ruleset"
     info "开机时它会清空 incus / 面板的全部 nft 表 —— 端口映射会集体失效"
     printf ' 是否停用 nftables.service? [Y/n]: '
-    read -r a
+    read -r a || return 0
     case "$a" in
         [nN]) info "已保留，请自行确认风险" ;;
         *) systemctl disable --now nftables >/dev/null 2>&1 && ok "已停用 nftables.service（规则仍由 incus 与各面板自己管理）" ;;
@@ -1558,7 +1558,7 @@ install_base() {
         return 0
     fi
     printf ' 需要安装:%s\n 继续? [Y/n]: ' "$miss"
-    read -r a
+    read -r a || return 0
     case "$a" in
         [nN]) info "已取消"; return 0 ;;
     esac
@@ -1581,7 +1581,7 @@ deps_check_update() {
         if apt list --upgradable 2>/dev/null | grep -q '^wireguard-tools/'; then
             warn "wireguard-tools 有新版本可用"
             printf ' 现在升级? [y/N]: '
-            read -r a
+            read -r a || return 0
             case "$a" in
                 [yY]) if apt-get install -y --only-upgrade wireguard-tools >/dev/null 2>&1; then
                           ok "wireguard-tools 已升级"
@@ -1603,7 +1603,7 @@ deps_check_update() {
         latest="$(curl -s --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null || true)"
         printf '  %-20s %s\n' "sing-box 最新发布" "${latest:-未知}"
         printf ' 是否重新下载并覆盖为最新版? [y/N]: '
-        read -r a
+        read -r a || return 0
         case "$a" in
             [yY]) rm -f "$SINGBOX_BIN"
                   install_singbox ;;
@@ -1693,7 +1693,7 @@ update_menu() {
     printf ' 更新只替换 /usr/local/bin/mr 与 mr-api.py\n'
     printf ' %s不会改动%s /etc/incus-multiroute（出口/绑定/令牌/白名单）和 /var/lib/incus-multiroute\n' "$GREEN" "$NC"
     printf ' 继续更新? [y/N]: '
-    read -r a
+    read -r a || return 0
     case "$a" in [yY]) ;; *) info "已取消，未做任何改动"; pause_back; return 0 ;; esac
     tmp="$(mktemp -d)"
     info "下载新版本 ..."
@@ -1754,13 +1754,13 @@ uninstall_all() {
     info "不会自动卸载 wireguard-tools / sing-box 二进制，也不会动 incus 与其它面板的表"
     subline
     printf ' %s第一次确认%s —— 输入 yes 继续，其它任意键取消: ' "$YELLOW" "$NC"
-    read -r a1
+    read -r a1 || return 0
     case "$a1" in
         [yY][eE][sS]) ;;
         *) info "已取消，未做任何改动"; pause_back; return 0 ;;
     esac
     printf ' %s第二次确认%s —— 最后机会，再次输入 yes: ' "$RED" "$NC"
-    read -r a2
+    read -r a2 || return 0
     case "$a2" in
         [yY][eE][sS]) ;;
         *) info "两次确认不一致，已取消，未做任何改动"; pause_back; return 0 ;;
@@ -1811,7 +1811,7 @@ uninstall_all() {
     rm -f /etc/systemd/system/mr-*.service /etc/systemd/system/mr-*.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
     printf ' 是否一并卸载依赖组件 wireguard-tools / sing-box? 输入 yes 卸载（其它保留）: '
-    read -r a3
+    read -r a3 || return 0
     if [ "$a3" = "yes" ]; then
         if dpkg -s wireguard-tools >/dev/null 2>&1; then
             apt-get remove -y wireguard-tools >/dev/null 2>&1 && info "已卸载 wireguard-tools" || warn "wireguard-tools 卸载失败"
@@ -1943,7 +1943,7 @@ sec_menu() {
             1) title "加固状态"; sec_status_table; pause_back ;;
             2)
                 printf ' 确认给 %s 个容器开启防伪? 输入 yes 继续: ' "$(incus list --format=csv -c n 2>/dev/null | grep -c .)"
-                read -r a
+                read -r a || return 0
                 [ "$a" = "yes" ] || { info "已取消"; pause_back; continue; }
                 sec_apply_all 1; pause_back
                 ;;
@@ -1984,7 +1984,7 @@ doctor() {
     if [ -x "$SINGBOX_BIN" ]; then
         check_item "sing-box" 0 "$SINGBOX_BIN（$("$SINGBOX_BIN" version 2>/dev/null | head -1 | sed 's/sing-box version //')）"
     else
-        check_item "sing-box" 1 "缺少 $SINGBOX_BIN（菜单 14 → 3 安装）"
+        check_item "sing-box" 1 "缺少 $SINGBOX_BIN（菜单 15 → 3 安装）"
     fi
     has_cmd wg;     check_item "wireguard-tools" "$?" "WireGuard 出口依赖"
     [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; check_item "ip_forward=1" "$?" "转发必需"
@@ -2022,11 +2022,11 @@ doctor() {
         if ip -6 rule show 2>/dev/null | grep -q "lookup 1001"; then
             check_item "IPv6 tproxy 策略路由" 0 "fwmark 0x80000001 → table 1001"
         else
-            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "IPv6 tproxy 策略路由" "缺失，按 10 重新下发"
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "IPv6 tproxy 策略路由" "缺失，按 11 重新下发"
         fi
         [ "$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)" = "0" ] \
             && check_item "br_netfilter(IPv6) 已关闭" 0 "双栈必需" \
-            || printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter(IPv6) 未关闭" "v6 tproxy 会不通，按 10 重新下发"
+            || printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter(IPv6) 未关闭" "v6 tproxy 会不通，按 11 重新下发"
     fi
     if [ -z "$b6" ] && [ -f "$BIND_CONF" ]; then
         # 网桥没 IPv6，但容器自己另有 IPv6（例如单独的 routed 网卡）：这部分流量不会被代理
@@ -2049,23 +2049,23 @@ doctor() {
         if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "0" ]; then
             check_item "br_netfilter 已关闭" 0 "TPROXY 必需"
         else
-            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter 未关闭" "TPROXY 不通，按 10 重新下发"
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "br_netfilter 未关闭" "TPROXY 不通，按 11 重新下发"
         fi
         if ip rule show 2>/dev/null | grep -q "lookup 1001"; then
             check_item "tproxy 策略路由" 0 "fwmark 0x80000001 → table 1001"
         else
-            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "tproxy 策略路由" "缺失，按 10 重新下发"
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "tproxy 策略路由" "缺失，按 11 重新下发"
         fi
     fi
     if [ "${AUTO_GRANT:-0}" = "1" ]; then
         check_item "新容器自动授权" 0 "已开启（定时器会把新容器纳管并下发 out）"
     else
-        printf '  %s[提示]%s %-26s 未开启（新容器需要手动授权，菜单 9 → 10 可开）\n' "$YELLOW" "$NC" "新容器自动授权"
+        printf '  %s[提示]%s %-26s 未开启（新容器需要手动授权，菜单 10 → 10 可开）\n' "$YELLOW" "$NC" "新容器自动授权"
     fi
     if systemctl is-active --quiet mr-sync.timer 2>/dev/null; then
         check_item "自动校验定时器" 0 "已启用（$(sync_timer_interval)）"
     else
-        printf '  %s[提示]%s %-26s 未开启（可选功能，菜单 9 → 7 开启）\n' "$YELLOW" "$NC" "自动校验定时器"
+        printf '  %s[提示]%s %-26s 未开启（可选功能，菜单 10 → 7 开启）\n' "$YELLOW" "$NC" "自动校验定时器"
     fi
     local dup
     dup="$(grep -v '^#' "$EXITS_CONF" 2>/dev/null | awk -F'|' 'NF>=7 && $7!="" {print $7}' | sort | uniq -d | tr '\n' ' ')"
@@ -2094,7 +2094,7 @@ doctor() {
         if [ -n "$nofilter" ]; then
             printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv4_filtering" "$nofilter"
             info "这些容器可以伪造源 IP 发包（反射攻击 / 日志污染）"
-            info "处理：菜单 [16] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
+            info "处理：菜单 [17] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
         else
             check_item "容器源 IP 防伪" 0 "已绑定容器均开启 ipv4_filtering"
         fi
@@ -2165,10 +2165,6 @@ exit_edit() {
     local f num name proto host port method pass mark wgkey wgif local expect enable lp
     local field val reason methods m msel i
     title "修改出口节点"
-    exits_print_numbered >/dev/null 2>&1
-    printf '  %-3s %-16s %-18s %-20s %-6s\n' "编号" "名称" "协议" "地址" "端口"
-    subline
-    exits_print_numbered | while read -r _; do :; done
     exits_print_numbered
     subline
     printf '输入要修改的出口编号（0 返回）: '; read -r num
@@ -2212,6 +2208,11 @@ exit_edit() {
                 edit_exit_field "$name" 1 "$val" || continue
                 # 绑定表里的出口名一起改
                 [ -f "$BIND_CONF" ] && { awk -F'|' -v OFS='|' -v o="$name" -v n="$val" '$3==o{$3=n} {print}' "$BIND_CONF" > "$BIND_CONF.tmp" && mv -f "$BIND_CONF.tmp" "$BIND_CONF"; }
+                # 逻辑节点/拓展节点的成员记录也要跟着改名，否则配置会生成不出来
+                if [ -f "$LOGIC_CONF" ] && grep -q "^$name|" "$LOGIC_CONF" 2>/dev/null; then
+                    awk -F'|' -v OFS='|' -v o="$name" -v n="$val" '$1==o{$1=n} {print}' "$LOGIC_CONF" > "$LOGIC_CONF.tmp" \
+                        && mv -f "$LOGIC_CONF.tmp" "$LOGIC_CONF"
+                fi
                 info "名称已改为 $val（用户端 out list 会显示新名称）"
                 name="$val"
                 edit_apply_changes
@@ -2456,7 +2457,7 @@ exit_add_extend() {
         printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
         printf '  %s[0]%s 返回上一步（重新输入节点名称）\n' "$YELLOW" "$NC"
         printf '请输入 [0-2]（回车=1）: '
-        read -r msel
+        read -r msel || return 0
         case "$msel" in
             0) info "已返回节点名称输入"
                printf '节点名称: '; read -r name
@@ -2475,7 +2476,7 @@ exit_add_extend() {
         for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
         printf '  %s[0]%s 返回上一步（重新选协议）\n' "$YELLOW" "$NC"
         printf '请选择 [0-%s]: ' "$((i - 1))"
-        read -r msel
+        read -r msel || return 0
         case "$msel" in 0|"") continue ;; esac
         case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
         method="$(printf '%s\n' $methods | sed -n "${msel}p")"
@@ -2541,10 +2542,10 @@ exit_add() {
             case "$proto" in
                 ss|ss2022) singbox_installed || {
                         err "还没有安装 sing-box（Shadowsocks / Shadowsocks 2022 客户端）"
-                        info "请先到菜单 [14] → [3] 安装"; pause_back; return 1; } ;;
+                        info "请先到菜单 [15] → [3] 安装"; pause_back; return 1; } ;;
                 wg) wg_installed || {
                         err "还没有安装 wireguard-tools"
-                        info "请先到菜单 [14] → [2] 安装"; pause_back; return 1; } ;;
+                        info "请先到菜单 [15] → [2] 安装"; pause_back; return 1; } ;;
             esac
             step="name"
             ;;
@@ -2575,7 +2576,7 @@ exit_add() {
             for m in $methods; do printf '  %s[%s]%s %s\n' "$GREEN" "$i" "$NC" "$m"; i=$((i + 1)); done
             printf '  %s[0]%s 返回上一步（重新输入服务器地址）\n' "$YELLOW" "$NC"
             printf '请输入 [0-%s]: ' "$((i - 1))"
-            read -r msel
+            read -r msel || return 0
             case "$msel" in 0|"") info "已返回服务器地址"; step="host"; continue ;; esac
             case "$msel" in *[!0-9]*) err "请输入序号"; continue ;; esac
             method="$(printf '%s\n' $methods | sed -n "${msel}p")"
@@ -2584,7 +2585,7 @@ exit_add() {
             ;;
         port)
             printf '端口（输入 0 返回上一步）: '
-            read -r port
+            read -r port || return 0
             case "$port" in 0|"") info "已返回上一步"; step="method"; continue ;; esac
             [ -n "$port" ] || port=$([ "$proto" = "wg" ] && echo 51820 || echo 2525)
             case "$port" in *[!0-9]*) err "端口必须是数字"; continue ;; esac
@@ -2744,7 +2745,7 @@ exit_del() {
         0|"") rm -f "$f"; return 0 ;;
         99)
             printf ' 确认删除全部 %s 个出口? 输入 yes: ' "$(exits_count)"
-            read -r a
+            read -r a || return 0
             [ "$a" = "yes" ] || { info "已取消"; rm -f "$f"; return 0; }
             printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
             printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
@@ -3038,7 +3039,7 @@ client_update_base() {
     title "更新用户端基准脚本"
     info "当前基准: $CLIENT_BASE"
     printf '新脚本路径（输入 0 或留空取消）: '
-    read -r src
+    read -r src || return 0
     case "$src" in 0|"") info "已取消"; return 0 ;; esac
     [ -f "$src" ] || { err "文件不存在"; pause_back; return 1; }
     cp -f "$src" "$CLIENT_BASE"
@@ -3082,25 +3083,25 @@ menu_main() {
         printf '  %s【出口节点】%s\n' "$CYAN" "$NC"
         printf '    %s[1]%s 出口节点列表\n' "$GREEN" "$NC"
         printf '    %s[2]%s 新增出口节点\n' "$GREEN" "$NC"
-        printf '    %s[3]%s 删除出口节点\n' "$GREEN" "$NC"
-        printf '    %s[4]%s 测试出口连通性\n' "$GREEN" "$NC"
-        printf '    %s[17]%s 修改出口节点\n' "$GREEN" "$NC"
+        printf '    %s[3]%s 修改出口节点\n' "$GREEN" "$NC"
+        printf '    %s[4]%s 删除出口节点\n' "$GREEN" "$NC"
+        printf '    %s[5]%s 测试出口连通性\n' "$GREEN" "$NC"
         printf '  %s【容器绑定】%s\n' "$CYAN" "$NC"
-        printf '    %s[5]%s 容器列表（含当前出口）\n' "$GREEN" "$NC"
-        printf '    %s[6]%s 绑定容器到出口\n' "$GREEN" "$NC"
-        printf '    %s[7]%s 解除容器绑定\n' "$GREEN" "$NC"
-        printf '    %s[8]%s 按 incus 实际状态校正\n' "$GREEN" "$NC"
+        printf '    %s[6]%s 容器列表（含当前出口）\n' "$GREEN" "$NC"
+        printf '    %s[7]%s 绑定容器到出口\n' "$GREEN" "$NC"
+        printf '    %s[8]%s 解除容器绑定\n' "$GREEN" "$NC"
+        printf '    %s[9]%s 按 incus 实际状态校正\n' "$GREEN" "$NC"
         printf '  %s【用户端】%s\n' "$CYAN" "$NC"
-        printf '    %s[9]%s 用户端 out 管理\n' "$GREEN" "$NC"
+        printf '    %s[10]%s 用户端 out 管理\n' "$GREEN" "$NC"
         printf '  %s【系统】%s\n' "$CYAN" "$NC"
-        printf '    %s[10]%s 重新下发全部规则\n' "$GREEN" "$NC"
-        printf '    %s[11]%s 环境体检\n' "$GREEN" "$NC"
-        printf '    %s[12]%s API 服务管理\n' "$GREEN" "$NC"
-        printf '    %s[13]%s 安装本脚本到系统\n' "$GREEN" "$NC"
+        printf '    %s[11]%s 重新下发全部规则\n' "$GREEN" "$NC"
+        printf '    %s[12]%s 环境体检\n' "$GREEN" "$NC"
+        printf '    %s[13]%s API 服务管理\n' "$GREEN" "$NC"
+        printf '    %s[14]%s 安装本脚本到系统\n' "$GREEN" "$NC"
         printf '  %s【环境】%s\n' "$CYAN" "$NC"
-        printf '    %s[14]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
-        printf '    %s[15]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
-        printf '    %s[16]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
+        printf '    %s[15]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
+        printf '    %s[16]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
+        printf '    %s[17]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
         printf '    %s[99]%s 一键卸载 Incus MultiRoute\n' "$RED" "$NC"
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
@@ -3110,21 +3111,21 @@ menu_main() {
         case "$choice" in
             1) exits_list ;;
             2) exit_add ;;
-            3) exit_del ;;
-            4) exit_test_menu ;;
-            5) containers_list ;;
-            6) bind_menu_choose ;;
-            7) bind_menu_remove ;;
-            8) bindings_refresh; apply_nft_only; pause_back ;;
-            9) client_menu ;;
-            10) apply_all 1; pause_back ;;
-            11) doctor ;;
-            12) api_menu ;;
-            13) install_self ;;
-            14) deps_menu ;;
-            15) update_menu ;;
-            16) sec_menu ;;
-            17) exit_edit ;;
+            3) exit_edit ;;
+            4) exit_del ;;
+            5) exit_test_menu ;;
+            6) containers_list ;;
+            7) bind_menu_choose ;;
+            8) bind_menu_remove ;;
+            9) bindings_refresh; apply_nft_only; pause_back ;;
+            10) client_menu ;;
+            11) apply_all 1; pause_back ;;
+            12) doctor ;;
+            13) api_menu ;;
+            14) install_self ;;
+            15) deps_menu ;;
+            16) update_menu ;;
+            17) sec_menu ;;
             99) uninstall_all ;;
             0) printf '%s再见%s\n' "$YELLOW" "$NC"; exit 0 ;;
             *) echo "无效选择"; sleep 1 ;;
@@ -3153,10 +3154,10 @@ install_self() {
         client_hash_base > "$CLIENT_HASH"
         ok "用户端基准脚本已就绪（hash $(cat "$CLIENT_HASH")）"
     else
-        warn "同目录未找到 out，请在菜单 9 -> 5 指定基准脚本路径"
+        warn "同目录未找到 out，请在菜单 10 -> 5 指定基准脚本路径"
     fi
     warn "自动下发默认关闭：装完之后不会给任何容器推送 out"
-    info "需要开给某个用户时：菜单 [9] -> [2] 授权并下发"
+    info "需要开给某个用户时：菜单 [10] -> [2] 授权并下发"
     ok "安装完成，任意位置输入 mr 即可运行菜单"
     pause_back
 }

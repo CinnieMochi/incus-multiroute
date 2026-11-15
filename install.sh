@@ -110,7 +110,7 @@ systemctl enable mr-api >/dev/null 2>&1 || true
 if systemctl restart mr-api >/dev/null 2>&1; then
     ok "API 服务已启动（开机自启）"
 else
-    warn "API 服务启动失败，可稍后在菜单 [12] 手动处理"
+    warn "API 服务启动失败，可稍后在菜单 [13] 手动处理"
 fi
 
 info "准备用户端 out 基准脚本 ..."
@@ -129,7 +129,7 @@ if curl -fsSL --max-time 60 -o "$DATA_DIR/client/out.tmp" "$RAW/client/out" 2>/d
     fi
     sha256sum "$DATA_DIR/client/out" | awk '{print $1}' > "$CONF_DIR/client.sha256"
 else
-    warn "未取到用户端 out（可稍后在菜单 [9]->[9] 指定本地路径）"
+    warn "未取到用户端 out（可稍后在菜单 [10]->[9] 指定本地路径）"
 fi
 
 # API 监听地址默认绑定网桥网关，避免暴露到公网
@@ -145,5 +145,5 @@ printf "%s\n" "============================================================"
 ok "安装完成"
 info "输入 mr 进入菜单"
 warn "自动下发默认关闭：不会给任何容器推送 out"
-info "需要开给某个用户：菜单 [9] -> [2] 授权并下发"
+info "需要开给某个用户：菜单 [10] -> [2] 授权并下发"
 printf "%s\n" "============================================================"
