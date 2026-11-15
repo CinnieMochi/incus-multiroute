@@ -28,7 +28,7 @@ mr
 | IPv6 | **双栈**：网桥配了 IPv6 就自动代理 v6（ULA 与独立公网 v6 都支持） |
 | 操作方式 | 全交互式菜单，不需要记命令 |
 | 隔离性 | 只维护自己的一张 nft 表，不碰 incus 与其它面板的规则 |
-| 当前版本 | **v3.0.1** |
+| 当前版本 | **v3.1.0** |
 
 ---
 
@@ -129,7 +129,7 @@ flowchart TB
         │                  │                   │
    ┌────▼─────┐      ┌─────▼────┐       ┌──────▼─────┐
    │ 落地机 A  │      │ 落地机 B  │       │  落地机 C   │
-   │ ss2022   │      │ ss2022   │       │ WireGuard  │
+   │Shadowsocks 2022│ │Shadowsocks 2022│       │ WireGuard  │
    └────┬─────┘      └─────┬────┘       └──────┬─────┘
         └──────────────────┼───────────────────┘
                            ▼
@@ -312,8 +312,8 @@ bash install.sh
 ```
 [14] 依赖安装（分类选择）
    [1] 基础套件        nftables / iproute2 / curl / jq / python3
-   [2] 隧道组件 · wg   wireguard-tools（只用 ss 出口可不装）
-   [3] 隧道组件 · ss   sing-box（用 ss / ss2022 出口必须装）
+   [2] 隧道组件 · WireGuard   wireguard-tools（只用 Shadowsocks 出口可不装）
+   [3] 隧道组件 · Shadowsocks / Shadowsocks 2022（sing-box）
    [4] 全部安装
 ```
 
@@ -323,8 +323,8 @@ bash install.sh
 
 ```
 [2] 新增出口
-   [1] ss2022
-   [2] ss
+   [1] Shadowsocks 2022（推荐）
+   [2] Shadowsocks（经典版）
    [3] wg
 
    加密方式（Shadowsocks 2022）：
@@ -409,8 +409,8 @@ curl -s https://api.ipify.org  # 看实际出口 IP
 
 | 选项 | 说明 |
 |---|---|
-| [1] ss2022 | Shadowsocks 2022，推荐 |
-| [2] ss | 经典 Shadowsocks |
+| [1] Shadowsocks 2022（推荐） | 加密更强，2022 系列算法 |
+| [2] Shadowsocks（经典版） | 兼容老服务端 |
 | [3] wg | WireGuard，全协议 |
 | **[4] 逻辑节点** | **多台机器拼一个出口：一台出 IPv4、一台出 IPv6** |
 
@@ -431,8 +431,8 @@ curl -s https://api.ipify.org  # 看实际出口 IP
 
 ```
 节点名: 双栈-HK
-  成员 1: ss2022 / a.ddns.net:8388 / 密码 / 家族=IPv4
-  成员 2: ss2022 / b.ddns.net:8388 / 密码 / 家族=IPv6（自动锁定，不能选 IPv4）
+  成员 1: Shadowsocks 2022 / a.ddns.net:8388 / 密码 / 家族=IPv4
+  成员 2: Shadowsocks 2022 / b.ddns.net:8388 / 密码 / 家族=IPv6（自动锁定，不能选 IPv4）
 ```
 
 - 用户访问 v4 网站 → 走 v4 成员；访问 v6 网站 → 走 v6 成员
@@ -445,7 +445,7 @@ curl -s https://api.ipify.org  # 看实际出口 IP
 
 | 协议 | 适用 | 说明 |
 |---|---|---|
-| ss2022 | 强烈推荐 | 加密更强，需要 16 或 32 字节 base64 密码 |
+| Shadowsocks 2022 | 强烈推荐 | 加密更强，需要 16 或 32 字节 base64 密码 |
 | ss | 兼容老服务端 | 经典 AEAD 加密 |
 | wg | 需要 UDP 全通 / ICMP | WireGuard，全协议隧道 |
 
@@ -689,7 +689,7 @@ out test        # 连通性测试
 
 ## 十一、透明代理（TPROXY）深入说明
 
-> 这一节讲 ss / ss2022 出口的底层机制，只用 wg 出口可以不看。
+> 这一节讲 Shadowsocks / Shadowsocks 2022 出口的底层机制，只用 wg 出口可以不看。
 
 ### 1. 为什么用 TPROXY
 
@@ -709,7 +709,7 @@ net.bridge.bridge-nf-call-iptables = 0
 
 **为什么必须关**：开启时，桥接进来的包会在 netfilter 里被处理两遍，TPROXY 的套接字投递会失效——现象是"规则命中、路由也对，但代理程序收不到任何连接"。
 
-脚本在新增第一个 ss 出口时会自动写入 /etc/sysctl.d/90-incus-multiroute.conf 并立即生效。
+脚本在新增第一个 Shadowsocks 出口时会自动写入 /etc/sysctl.d/90-incus-multiroute.conf 并立即生效。
 
 ### 3. 关掉它的影响（实测结论）
 
@@ -730,25 +730,25 @@ net.bridge.bridge-nf-call-iptables = 0
 
 | 操作 | br_netfilter |
 |---|---|
-| 新增 ss 出口 | → 0 |
-| 停用所有 ss 出口 | → 1（自动） |
+| 新增 Shadowsocks 出口 | → 0 |
+| 停用所有 Shadowsocks 出口 | → 1（自动） |
 | 一键卸载 | → 1（自动） |
 
 ### 5. 每个出口占一个本地端口
 
-**是的，每增加一个 ss / ss2022 出口，就会多占一个本地端口。**
+**是的，每增加一个 Shadowsocks / Shadowsocks 2022 出口，就会多占一个本地端口。**
 
 ```
-第 1 个 ss 出口 → 网桥IP:27001
-第 2 个 ss 出口 → 网桥IP:27002
+第 1 个 Shadowsocks 出口 → 网桥IP:27001
+第 2 个 Shadowsocks 出口 → 网桥IP:27002
 ...
-第 N 个 ss 出口 → 网桥IP:(27000 + N)
+第 N 个 Shadowsocks 出口 → 网桥IP:(27000 + N)
 ```
 
 | 项目 | 说明 |
 |---|---|
 | 端口段 | 27000-27099（`mr.conf` 里的 TPROXY_BASE 可改） |
-| 上限 | **99 个 ss 出口**；超出会被拒绝并提示 |
+| 上限 | **99 个 Shadowsocks 出口**；超出会被拒绝并提示 |
 | wg 出口 | **不占端口**（走三层路由，不用 tproxy） |
 | 停用的出口 | 释放端口，但编号仍保留（重新启用回到原端口） |
 | 每个出口的资源 | 一个 sing-box 进程，实测约 **57 MB** 内存 |
@@ -822,7 +822,7 @@ nft 的 tproxy 规则也明确指向这个地址（`tproxy ip to 网桥IP:端口
 链路变成：
 
 ```
-容器（始终 IPv4） → 宿主（有 IPv6 出网） ──IPv6──> 落地机 ss2022
+容器（始终 IPv4） → 宿主（有 IPv6 出网） ──IPv6──> 落地机 Shadowsocks 2022
 ```
 
 两个前提：宿主机有可用的 IPv6 出网、落地机在该地址上监听。
@@ -837,7 +837,7 @@ WireGuard 出口填 IPv6 也支持，脚本会自动写成 [地址]:端口。
 
 ```
 开机
- ├─ 系统读取 /etc/sysctl.d/90-incus-multiroute.conf → br_netfilter=0（如有 ss 出口）
+ ├─ 系统读取 /etc/sysctl.d/90-incus-multiroute.conf → br_netfilter=0（如有 Shadowsocks 出口）
  ├─ mr-restore.service 执行 mr apply
  │   ├─ 重新生成并加载 inet multiroute
  │   ├─ 重建 tproxy 策略路由（ip rule + table 1001）
@@ -997,7 +997,7 @@ out 会被自动校验重新推送，但绑定表里的 IP 是旧的，那个容
 ├── tokens.conf        每个容器的令牌
 ├── client.sha256      用户端基准脚本的哈希
 └── singbox/
-    └── 0x1001.json    每个 ss 出口一份 sing-box 配置（文件名是 mark）
+    └── 0x1001.json    每个 Shadowsocks 出口一份 sing-box 配置（文件名是 mark）
 ```
 
 ### 运行数据
@@ -1023,7 +1023,7 @@ out 会被自动校验重新推送，但绑定表里的 IP 是旧的，那个容
 | mr-api.service | 用户查询 API |
 | mr-restore.service | 开机重新下发规则 |
 | mr-sync.timer / .service | 周期性校验用户端脚本（可选） |
-| mr-ss-标记.service | 每个 ss 出口一个 sing-box 进程 |
+| mr-ss-标记.service | 每个 Shadowsocks 出口一个 sing-box 进程 |
 
 ### 命令速查
 
@@ -1043,6 +1043,7 @@ mr harden       # 给所有容器开启源 IP 防伪（IPv4/IPv6 按宿主机实
 
 | 版本 | 主要变化 |
 |---|---|
+| v3.1.0 | 全部界面与文档统一使用完整协议名（Shadowsocks / Shadowsocks 2022 / WireGuard / 逻辑节点）；逻辑节点新增成员明细展示；出口/逻辑节点配置文件权限收紧为 600（含明文密码）；卸载时一并停止逻辑节点单元 |
 | v3.0.1 | 体检新增"容器有 IPv6 但网桥没有"的告警（这类 v6 流量不经过网桥、不会被代理） |
 | v3.0.0 | **双栈透明代理**（网桥有 IPv6 自动启用 v6 劫持/策略路由/双入站）；**逻辑节点**（多机拼 v4+v6 出口，按 `ip_version` 分流）；密码按加密方式强校验并支持 **SS2022 双密钥**；新增容器多 IPv6 映射与 v6 体检项 |
 | v2.7.0 | 取消"复用系统 sing-box"：固定使用自己的一份（避免被面板升级覆写），安装后自动做兼容性自检；体检显示实际路径与版本 |
@@ -1055,13 +1056,13 @@ mr harden       # 给所有容器开启源 IP 防伪（IPv4/IPv6 按宿主机实
 | v2.4.0 | 新增出口遇到端口占用时，只给新出口指定端口（出口配置新增第 13 字段），老出口不重启不断线 |
 | v2.3.1 | 新增出口前先检查端口占用，被占时交互式换端口段（不留半条配置） |
 | v2.3.0 | 端口段从 41000-41099 迁到 **27000-27099**（旧配置自动迁移）；端口被占时用户建映射会明确报 address already in use，避免踩号 |
-| v2.2.1 | 端口号只按 ss/ss2022 出口分配（wg 出口不再挤占端口号）；端口超出 27000-27099 时明确拒绝 |
+| v2.2.1 | 端口号只按 Shadowsocks / Shadowsocks 2022 出口分配（WireGuard 出口不再挤占端口号）；端口超出 27000-27099 时明确拒绝 |
 | v2.2.0 | sing-box 改为只监听网桥地址（代理端口不再暴露公网）；tproxy 规则明确指向网桥 IP；新增端口占用检测（体检 + 新增出口时告警）；修复容器多 IP 时绑定被带偏 |
 | v2.1.0 | 新增 [16] 安全加固：一键开启容器源 IP 防伪（IPv4/IPv6 按宿主机协议族自动选择）；修复容器有多个 IPv4 时绑定记录被带偏的问题（优先取网桥网段内的地址） |
 | v2.0.3 | 增删/停用出口只重启受影响的那个 sing-box，不再全量重启；绑定类操作全部走轻量下发；菜单 10 保留强制全量重启 |
 | v2.0.2 | 切换出口不再重启 sing-box（新增 mr apply-nft），切节点不再打断自己和别人的连接；tproxy 只劫持容器主动发起的连接，容器自建服务端回包不再被误劫持 |
-| v2.0.1 | 支持 IPv6 落地机（WG 端点自动加方括号）；新增 IPv6 旁路提示；TPROXY_BASE 兜底；无 ss 出口时自动恢复 br_netfilter；nft 下发前先校验；体检修掉自身 mark 误报 |
-| v2.0.0 | ss/ss2022 改用 sing-box TPROXY，**TCP 与 UDP 全部代理**；自动关闭 br_netfilter；体检新增 br_netfilter 与 tproxy 策略路由检查；卸载自动恢复 sysctl |
+| v2.0.1 | 支持 IPv6 落地机（WG 端点自动加方括号）；新增 IPv6 旁路提示；TPROXY_BASE 兜底；无 Shadowsocks 出口时自动恢复 br_netfilter；nft 下发前先校验；体检修掉自身 mark 误报 |
+| v2.0.0 | Shadowsocks / Shadowsocks 2022 改用 sing-box TPROXY，**TCP 与 UDP 全部代理**；自动关闭 br_netfilter；体检新增 br_netfilter 与 tproxy 策略路由检查；卸载自动恢复 sysctl |
 | v1.4.6 | 修复菜单在输入流结束时无限刷屏 |
 | v1.4.5 | 返回类选项改为黄色，与功能项区分 |
 | v1.4.4 | 新增出口后自动下发；自动校验间隔可自定义（最小 5 分钟）；体检将 rp_filter 与定时器改为提示；卸载可选择一并卸载依赖 |

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.0.1
+# Incus MultiRoute 宿主机出口管理脚本 v3.1.0
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -42,7 +42,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.1.0"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -125,6 +125,8 @@ ensure_dirs() {
         printf 'LISTEN="%s:18988"\n' "$_gw" > "$CONF_DIR/api.conf"
     fi
     [ -f "$CLIENT_ALLOW_CONF" ] || printf '%s\n' '# 授权使用 out 的容器，一行一个；不在本表的容器永远不会被下发' > "$CLIENT_ALLOW_CONF"
+    # 出口配置里含明文密码，只允许 root 读
+    chmod 600 "$EXITS_CONF" "$LOGIC_CONF" "$MAIN_CONF" 2>/dev/null || true
 }
 
 init_main_conf() {
@@ -211,7 +213,7 @@ exit_exists() { exit_get "$1" >/dev/null 2>&1; }
 
 exit_ss_port() {
     # ss 出口的本地代理端口 = TPROXY_BASE + 序号
-    # 只对 ss/ss2022 计数：wg 出口不占端口，不该挤掉端口号
+    # 只对 Shadowsocks 出口计数：WireGuard 出口不占端口，不该挤掉端口号
     local want="$1" l i=0 name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
@@ -533,7 +535,7 @@ exit_add_logic() {
         idx=$((idx + 1))
         subline
         printf '  %s成员 %s%s\n' "$BLUE" "$idx" "$NC"
-        printf '协议: [1] ss2022  [2] ss   （回车=1）: '; read -r ps
+        printf '协议: [1] Shadowsocks 2022（推荐）  [2] Shadowsocks（经典版）   （回车=1）: '; read -r ps
         case "$ps" in 2) step="ss" ;; *) step="ss2022" ;; esac
         if [ "$step" = "ss2022" ]; then
             methods="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305"
@@ -640,7 +642,7 @@ apply_wg_one() {
     [ "$proto" = "wg" ] || return 0
     [ "$enable" = "0" ] && return 0
     has_cmd wg || { warn "$name: 未安装 wireguard-tools，跳过"; return 1; }
-    [ -n "$wgif" ] || { warn "$name: 缺少 wg 接口名"; return 1; }
+    [ -n "$wgif" ] || { warn "$name: 缺少 WireGuard 接口名"; return 1; }
     if ! ip link show "$wgif" >/dev/null 2>&1; then
         ip link add dev "$wgif" type wireguard || { warn "$name: 建接口失败"; return 1; }
     fi
@@ -657,7 +659,7 @@ apply_wg_one() {
     ip rule del fwmark "$mark" table "$table" 2>/dev/null || true
     ip rule add fwmark "$mark" table "$table" priority "$((1000 + table - 10000))"
     ip route replace default dev "$wgif" table "$table"
-    ok "$name: wg 接口 $wgif 就绪（表 $table）"
+    ok "$name: WireGuard 接口 $wgif 就绪（表 $table）"
 }
 
 wg_table() {
@@ -674,7 +676,7 @@ ensure_wg_key() {
     local k pub a
     [ -n "$WG_PRIVATE_KEY" ] && return 0
     has_cmd wg || { err "需要先安装 wireguard-tools（菜单 14 -> 2）"; return 1; }
-    printf ' 尚未生成宿主机 wg 私钥，现在生成? [Y/n]: '
+    printf ' 尚未生成宿主机 WireGuard 私钥，现在生成? [Y/n]: '
     read -r a
     case "$a" in [nN]) err "已取消"; return 1 ;; esac
     k="$(wg genkey 2>/dev/null)"
@@ -682,7 +684,7 @@ ensure_wg_key() {
     pub="$(printf '%s' "$k" | wg pubkey 2>/dev/null)"
     save_main_var WG_PRIVATE_KEY "$k"
     WG_PRIVATE_KEY="$k"
-    ok "已生成并保存宿主机 wg 私钥"
+    ok "已生成并保存宿主机 WireGuard 私钥"
     printf ' %s宿主机公钥%s（填进出口机 wg 配置的 [Peer] PublicKey）:\n  %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$pub" "$NC"
 }
 
@@ -736,6 +738,16 @@ ss_classic_pass_check() {  # $1=password
     [ -n "$pass" ] || { echo "密码不能为空"; return 1; }
     echo ok
     return 0
+}
+
+proto_label() {
+    case "$1" in
+        ss2022) echo "Shadowsocks 2022" ;;
+        ss)     echo "Shadowsocks" ;;
+        wg)     echo "WireGuard" ;;
+        logic)  echo "逻辑节点" ;;
+        *)      echo "$1" ;;
+    esac
 }
 
 json_esc() {
@@ -1422,9 +1434,9 @@ install_singbox() {
         err "sing-box 安装后无法运行"; return 1
     fi
     if singbox_probe "$SINGBOX_BIN"; then
-        ok "sing-box 安装完成（$ver），兼容性自检通过（tproxy + ss2022）"
+        ok "sing-box 安装完成（$ver），兼容性自检通过（tproxy + Shadowsocks 2022）"
     else
-        warn "sing-box 已安装（$ver），但兼容性自检未通过：可能不支持 tproxy 或 ss2022"
+        warn "sing-box 已安装（$ver），但兼容性自检未通过：可能不支持 tproxy 或 Shadowsocks 2022"
         info "请换一个官方 release 版本，或手动验证: $SINGBOX_BIN check"
     fi
 }
@@ -1532,10 +1544,10 @@ deps_menu() {
         subline
         printf '  %s[1]%s 基础套件\n' "$GREEN" "$NC"
         printf '        nftables / iproute2 / curl / jq / python3 / ca-certificates\n'
-        printf '  %s[2]%s 隧道组件 · wg\n' "$GREEN" "$NC"
-        printf '        wireguard-tools —— 使用 wg 出口时必需\n'
-        printf '  %s[3]%s 隧道组件 · ss / ss2022（sing-box）\n' "$GREEN" "$NC"
-        printf '        sing-box 客户端 —— 使用 ss / ss2022 出口时必需（支持 TCP+UDP）\n'
+        printf '  %s[2]%s 隧道组件 · WireGuard\n' "$GREEN" "$NC"
+        printf '        wireguard-tools —— 使用 WireGuard 出口时必需\n'
+        printf '  %s[3]%s 隧道组件 · Shadowsocks / Shadowsocks 2022（sing-box）\n' "$GREEN" "$NC"
+        printf '        sing-box 客户端 —— 使用 Shadowsocks / Shadowsocks 2022 出口时必需（支持 TCP+UDP）\n'
         printf '  %s[4]%s 全部安装（1 + 2 + 3）\n' "$GREEN" "$NC"
         printf '  %s[5]%s 检查组件更新（已装的才会检查）\n' "$GREEN" "$NC"
         printf '  ------------------------------------------------------------\n'
@@ -1657,7 +1669,7 @@ update_menu() {
 uninstall_all() {
     local ans name l proto wgif mark table
     title "一键卸载 Incus MultiRoute"
-    warn "将删除：nft 表 inet multiroute、wg 出口接口与策略路由、全部 mr-* 单元、"
+    warn "将删除：nft 表 inet multiroute、WireGuard 出口接口与策略路由、全部 mr-* 单元、"
     warn "        /etc/incus-multiroute、/var/lib/incus-multiroute、/usr/local/bin/mr 与 mr-api.py"
     info "不会自动卸载 wireguard-tools / sing-box 二进制，也不会动 incus 与其它面板的表"
     subline
@@ -1684,7 +1696,7 @@ uninstall_all() {
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
         case "$proto" in
-            ss|ss2022) systemctl disable --now "mr-ss-$mark.service" >/dev/null 2>&1 || true ;;
+            ss|ss2022|logic) systemctl disable --now "mr-ss-$mark.service" >/dev/null 2>&1 || true ;;
         esac
     done < "$EXITS_CONF" 2>/dev/null
     # 兜底：清掉任何残留的 mr-ss-* 单元
@@ -1894,14 +1906,14 @@ doctor() {
     else
         check_item "sing-box" 1 "缺少 $SINGBOX_BIN（菜单 14 → 3 安装）"
     fi
-    has_cmd wg;     check_item "wireguard-tools" "$?" "wg 出口依赖"
+    has_cmd wg;     check_item "wireguard-tools" "$?" "WireGuard 出口依赖"
     [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; check_item "ip_forward=1" "$?" "转发必需"
     local rpv
     rpv="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)"
     if [ "$rpv" = "2" ]; then
         check_item "rp_filter=2（loose）" 0 "策略路由已就绪"
     else
-        printf '  %s[提示]%s %-26s 当前 %s；用 ss 出口不需要，用 wg 出口时建议设为 2\n' "$YELLOW" "$NC" "rp_filter" "${rpv:-未知}"
+        printf '  %s[提示]%s %-26s 当前 %s；用 ss 出口不需要，用 WireGuard 出口时建议设为 2\n' "$YELLOW" "$NC" "rp_filter" "${rpv:-未知}"
     fi
     nft list table inet multiroute >/dev/null 2>&1; check_item "nft 表 inet multiroute" "$?" "未下发过规则时属于正常"
     [ -f "$CLIENT_BASE" ]; check_item "用户端基准脚本" "$?" "$CLIENT_BASE"
@@ -2095,7 +2107,7 @@ exit_add() {
     case "$proto" in
         ss|ss2022|logic)
             if ! singbox_installed; then
-                err "还没有安装 sing-box（ss/ss2022 客户端）"
+                err "还没有安装 sing-box（Shadowsocks / Shadowsocks 2022 客户端）"
                 info "请先到 菜单 [14] → [3] 安装，装完再回来新增 $proto 出口"
                 info "或在 菜单 [14] → [4] 一次装齐所有依赖"
                 pause_back
@@ -2251,7 +2263,7 @@ exits_print_numbered() {
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
         [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
-        printf '  %s%2s%s  %-16s %-8s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$proto" "$host" "$port" "$mark" "$st"
+        printf '  %s%2s%s  %-16s %-18s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$st"
         printf '%s\n' "$name" >> "$1"
         idx=$((idx + 1))
     done < "$EXITS_CONF"
@@ -2274,7 +2286,7 @@ containers_print_numbered() {
 exits_show_table() {
     local f
     f="$(mktemp)"
-    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
     subline
     exits_print_numbered "$f"
     rm -f "$f"
@@ -2285,7 +2297,7 @@ exit_del() {
     clear_if_tty
     title "删除出口节点"
     f="$(mktemp)"
-    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
     subline
     exits_print_numbered "$f"
     subline
@@ -2327,7 +2339,7 @@ show_exit_row() {
     local name="$1" proto="$2" host="$3" port="$4" m="$5" pw="$6" mark="$7" wgkey="$8" wgif="$9" local="${10}" expect="${11}" enable="${12}"
     local st
     [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
-    printf '  %-14s %-8s %-20s %-6s %-8s %s\n' "$name" "$proto" "$host" "$port" "$mark" "$st"
+    printf '  %-14s %-18s %-20s %-6s %-8s %s\n' "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$st"
 }
 
 exits_list() {
@@ -2336,7 +2348,7 @@ exits_list() {
         clear_if_tty
         title "出口节点（启用开关）"
         f="$(mktemp)"
-        printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+        printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
         subline
         exits_print_numbered "$f"
         subline
@@ -2385,6 +2397,13 @@ exit_test_one() {
             local u port
             u="mr-ss-$(exit_fld "$l" 7).service"
             port="$(exit_ss_port "$name")"
+            if [ "$proto" = "logic" ]; then
+                local _m _f _h
+                while IFS='|' read -r _n _idx _p _h _pt _me _pa _f; do
+                    case "$_n" in ''|'#'*) continue ;; esac
+                    printf '  %-14s   成员 %s：%s / %s / %s:%s\n' "" "$_idx" "$(proto_label "$_p")" "$_f" "$_h" "$_pt"
+                done < <(logic_members "$name")
+            fi
             if systemctl is-active --quiet "$u" 2>/dev/null && ss -ltn 2>/dev/null | grep -q ":$port "; then
                 printf '  %-14s %s本地 %s 就绪（端到端请在容器内实测）%s\n' "$name" "$GREEN" "$port" "$NC"
             else
@@ -2400,7 +2419,7 @@ exit_test_menu() {
     clear_if_tty
     title "测试出口连通性"
     f="$(mktemp)"
-    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
     subline
     exits_print_numbered "$f"
     subline
@@ -2458,7 +2477,7 @@ bind_menu_choose() {
 
     clear_if_tty
     ef="$(mktemp)"
-    printf '  %-3s %-16s %-8s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
     subline
     exits_print_numbered "$ef"
     subline
