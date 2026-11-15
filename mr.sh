@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.3.0
+# Incus MultiRoute 宿主机出口管理脚本 v3.3.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -37,12 +37,13 @@ CLIENT_ALLOW_CONF="$CONF_DIR/clients.conf"
 CLIENT_DENY_CONF="$CONF_DIR/clients.deny"
 LOGIC_CONF="$CONF_DIR/logical.conf"
 AUTO_GRANT="${AUTO_GRANT:-0}"
+BRIDGE_IPV6_AUTO="${BRIDGE_IPV6_AUTO:-0}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.3.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -460,6 +461,20 @@ gen_nft() {
         echo '    }'
         echo '}'
     } > "$NFT_FILE"
+}
+
+maybe_revert_bridge_ipv6() {
+    # 只有"网桥 IPv6 是本脚本为拓展节点开的"才还原；已经是别人配的就不动
+    [ "${BRIDGE_IPV6_AUTO:-0}" = "1" ] || return 0
+    # 还有其它拓展节点（含 direct 成员）就保持开启
+    if [ -f "$LOGIC_CONF" ] && grep -q '|direct|' "$LOGIC_CONF" 2>/dev/null; then
+        return 0
+    fi
+    info "没有拓展节点了，把网桥 IPv6 还原成原来的状态 ..."
+    incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
+    incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
+    save_main_var BRIDGE_IPV6_AUTO 0
+    ok "网桥 IPv6 已还原（$BRIDGE 不再有 IPv6 地址）"
 }
 
 logic_members() {  # $1=节点名
@@ -2017,6 +2032,9 @@ doctor() {
     fi
     local b6
     b6="$(bridge_ipv6 2>/dev/null)"
+    if [ -z "$b6" ]; then
+        printf '  %s[提示]%s %-26s %s\n' "$YELLOW" "$NC" "网桥 IPv6" "未启用（只有 IPv4；需要双栈时用 菜单 [2] → [5] 自动开启）"
+    fi
     if [ -n "$b6" ]; then
         check_item "网桥 IPv6" 0 "$b6（双栈透明代理已启用）"
         if ip -6 rule show 2>/dev/null | grep -q "lookup 1001"; then
@@ -2430,11 +2448,31 @@ exit_add_extend() {
     printf '  %-22s %s\n' "网桥 IPv6" "${b6:-未启用}"
     subline
     if [ -z "$b6" ]; then
-        err "网桥没有 IPv6 地址，容器就不会有 IPv6 流量，拓展没有意义"
-        info "先用这条命令给网桥开一段 ULA（不占用公网地址）："
-        info "  incus network set incusbr0 ipv6.address fd42:1:1::1/64"
-        info "  incus network set incusbr0 ipv6.nat true"
-        pause_back; return 1
+        warn "网桥没有 IPv6 地址，容器就不会有 IPv6 流量，拓展没有意义"
+        info "需要先给网桥开一段 ULA（不占用公网地址），命令是："
+        info "  incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
+        info "  incus network set $BRIDGE ipv6.nat true"
+        printf '是否现在自动执行？[y/N]: '; read -r a6 || return 0
+        case "$a6" in
+            y|Y) ;;
+            *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
+        esac
+        info "正在给网桥开启 IPv6 ..."
+        if ! incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
+            err "开启失败：incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
+            pause_back; return 1
+        fi
+        incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
+        sleep 2
+        b6="$(bridge_ipv6 2>/dev/null)"
+        if [ -z "$b6" ]; then
+            err "已执行命令，但没取到网桥 IPv6 地址，请检查 incus network show $BRIDGE"
+            pause_back; return 1
+        fi
+        # 记下"这是我们开的"，删除拓展节点时自动还原
+        save_main_var BRIDGE_IPV6_AUTO 1
+        ok "网桥 IPv6 已开启：$b6"
+        info "删除最后一个拓展节点时会自动还原为原来的状态"
     fi
     if [ "$g4" = "1" ] && [ "$g6" = "1" ]; then
         info "本机已是双栈，直接新增普通出口即可，不需要拓展"
@@ -2764,8 +2802,9 @@ exit_del() {
     mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
     awk -F'|' -v n="$name" '$3!=n' "$BIND_CONF" > "$BIND_CONF.tmp" 2>/dev/null || :
     mv -f "$BIND_CONF.tmp" "$BIND_CONF"
-    logic_del_node "$name" 2>/dev/null || true
+        logic_del_node "$name" 2>/dev/null || true
     ok "已删除 $name，相关绑定已解除"
+    maybe_revert_bridge_ipv6
     apply_all >/dev/null 2>&1
     pause_back
 }
