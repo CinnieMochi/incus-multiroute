@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.0
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.1
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -44,7 +44,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.4.1"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -2321,9 +2321,13 @@ exit_edit() {
                 done
                 ;;
             6)
-                printf '新期望出口 IP（留空=用服务器地址，0 返回）: '; read -r val || return 0
+                printf '新期望出口 IP（留空=用服务器地址，输入 - 清空，0 返回）: '; read -r val || return 0
                 case "$val" in 0) continue ;; esac
-                [ -n "$val" ] || val="$host"
+                if [ "$val" = "-" ]; then
+                    val=""                # 显式清空
+                elif [ -z "$val" ]; then
+                    val="$host"           # 留空 = 用服务器地址
+                fi
                 edit_exit_field "$name" 11 "$val" || continue
                 ok "已保存（这一项只用于显示与核对，不需要重启）"
                 ;;
@@ -2339,10 +2343,10 @@ exit_edit() {
 }
 
 edit_apply_changes() {
-    info "正在重新下发（该出口的 sing-box 会自动重启）..."
+    info "正在重新下发（只有配置变化的出口才会重启）..."
     apply_all
     info "用户端无需重新授权；out list 只显示出口名，改地址/端口/密码对用户透明"
-    pause_back
+    # 不 pause：直接回到修改菜单，方便连续改多项
 }
 
 edit_exit_field() {  # $1=出口名 $2=字段号 $3=新值
