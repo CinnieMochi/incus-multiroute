@@ -132,10 +132,15 @@ def incus_ip_map():
 
 
 def container_by_ip(ip):
+    # 先用 incus 的实时映射（唯一真相），再退回绑定表：
+    # 绑定表可能残留已删除容器的旧 IP，IP 被新容器复用时会认错人（token 就会对不上）
+    name = incus_ip_map().get(ip)
+    if name:
+        return name
     for name, b in load_bindings().items():
         if b["ip"] == ip:
             return name
-    return incus_ip_map().get(ip)
+    return None
 
 
 def exit_display(name):

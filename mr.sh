@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.2
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.3
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -39,12 +39,13 @@ LOGIC_CONF="$CONF_DIR/logical.conf"
 AUTO_GRANT="${AUTO_GRANT:-0}"
 BRIDGE_IPV6_AUTO="${BRIDGE_IPV6_AUTO:-0}"
 BRIDGE_IPV4_AUTO="${BRIDGE_IPV4_AUTO:-0}"
+AUTO_HARDEN="${AUTO_HARDEN:-0}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.2"
+SCRIPT_VERSION="3.4.3"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -382,6 +383,29 @@ bind_remove() {
     ok "已解除绑定 $name（回入口机直出）"
 }
 
+clients_prune() {  # 删掉"容器已不存在"的授权/令牌/绑定记录
+    local live f name n=0 line
+    live="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"' | sed '/^$/d')"
+    [ -n "$live" ] || return 0
+    for f in "$CLIENT_ALLOW_CONF" "$TOKEN_CONF" "$BIND_CONF" "$CLIENT_DENY_CONF"; do
+        [ -f "$f" ] || continue
+        : > "$f.tmp"
+        while IFS= read -r line; do
+            case "$line" in ''|'#'*) printf '%s\n' "$line" >> "$f.tmp"; continue ;; esac
+            name="$(printf '%s' "$line" | cut -d'|' -f1)"
+            if printf '%s\n' "$live" | grep -qxF "$name"; then
+                printf '%s\n' "$line" >> "$f.tmp"
+            else
+                n=$((n + 1))
+            fi
+        done < "$f"
+        mv -f "$f.tmp" "$f"
+        chmod 600 "$f" 2>/dev/null || true
+    done
+    [ "$n" -gt 0 ] && info "已清理 $n 条失效记录（容器已删除）"
+    return 0
+}
+
 bindings_refresh() {
     # 用 incus 的真实 IP 校正 bindings，容器内改 IP 也能自愈
     local l name ip changed=0
@@ -389,6 +413,9 @@ bindings_refresh() {
     while IFS= read -r l; do
         case "$l" in ''|'#'*) printf '%s\n' "$l" >> "$BIND_CONF.tmp"; continue ;; esac
         IFS='|' read -r b_name b_ip b_exit b_mark <<< "$l"
+        if ! incus info "$b_name" >/dev/null 2>&1 </dev/null; then
+            info "已移除失效绑定：$b_name（容器已不存在）"; changed=1; continue
+        fi
         ip="$(container_ip "$b_name")"
         [ -n "$ip" ] || { warn "容器 $b_name 不在线，保留原绑定"; printf '%s\n' "$l" >> "$BIND_CONF.tmp"; continue; }
         [ "$ip" = "$b_ip" ] || { info "校正 $b_name: $b_ip -> $ip"; changed=1; }
@@ -563,7 +590,7 @@ exit_add_logic() {
     local name mark idx=0 used4=0 used6=0
     local step host port method pass fam ps msel methods m reason st
     clear_if_tty
-    title "新增逻辑节点（IPv4 + IPv6 组合）"
+    title "新增逻辑节点（2 台机器拼 IPv4 + IPv6）"
     info "一个逻辑节点最多两个成员：一个提供 IPv4、一个提供 IPv6"
     info "用户访问 v4 网站走 v4 成员，访问 v6 网站走 v6 成员"
     info "每一步输入 0 都可以返回上一步"
@@ -1212,6 +1239,9 @@ auto_enroll_new() {
         client_enroll_quiet "$c"
         n=$((n + 1))
         echo "$(date '+%F %T') 自动授权并下发: $c" >> "$DATA_DIR/sync.log"
+        if [ "${AUTO_HARDEN:-0}" = "1" ]; then
+            sec_apply_one "$c" 1 >/dev/null 2>&1 && echo "$(date '+%F %T') 自动加固: $c" >> "$DATA_DIR/sync.log"
+        fi
     done
     [ "$n" -gt 0 ] && info "自动授权了新容器 $n 个"
     return 0
@@ -1347,6 +1377,7 @@ client_status() {
 
 client_sync() {
     local quiet="${1:-}" base n h pushed=0 tot=0
+    clients_prune >/dev/null 2>&1 || true
     auto_enroll_new
     base="$(client_hash_base 2>/dev/null || true)"
     [ -n "$base" ] || { [ -n "$quiet" ] || err "缺少基准脚本 $CLIENT_BASE"; return 1; }
@@ -1970,6 +2001,125 @@ sec_apply_all() {
     fi
 }
 
+bridge_family_menu() {
+    local a c b4 b6 g4 g6
+    while :; do
+        clear_if_tty
+        title "辅助功能 · 网桥地址族"
+        b4="$(bridge_ipv4 2>/dev/null)"; b6="$(bridge_ipv6 2>/dev/null)"
+        g4=0; g6=0
+        ip -4 route show default 2>/dev/null | grep -q default && g4=1
+        ip -6 route show default 2>/dev/null | grep -q default && g6=1
+        printf '  %-22s %s\n' "宿主机 IPv4 出网" "$([ "$g4" = 1 ] && echo 有 || echo 无)"
+        printf '  %-22s %s\n' "宿主机 IPv6 出网" "$([ "$g6" = 1 ] && echo 有 || echo 无)"
+        printf '  %-22s %s\n' "网桥 IPv4（$BRIDGE）" "${b4:-未启用}"
+        printf '  %-22s %s\n' "网桥 IPv6（$BRIDGE）" "${b6:-未启用}"
+        subline
+        printf '    %s[1]%s 网桥 IPv4：%s\n' "$GREEN" "$NC" "$([ -n "$b4" ] && echo 关闭 || echo 开启)"
+        printf '    %s[2]%s 网桥 IPv6：%s\n' "$GREEN" "$NC" "$([ -n "$b6" ] && echo 关闭 || echo 开启)"
+        printf '    %s[3]%s 全部开启（缺哪个开哪个）\n' "$GREEN" "$NC"
+        printf '    %s[4]%s 全部关闭（只关本脚本开启的）\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
+        line
+        printf '请输入选项 [0-4]: '
+        read -r a || return 0
+        case "$a" in
+            0|"") return 0 ;;
+            1)
+                if [ -n "$b4" ]; then
+                    warn "关闭网桥 IPv4 后，容器的 IPv4 代理与绑定会全部失效"
+                    printf ' 确认关闭? 输入 yes: '; read -r c || return 0
+                    [ "$c" = "yes" ] || { info 已取消; continue; }
+                    incus network unset "$BRIDGE" ipv4.address </dev/null >/dev/null 2>&1 || true
+                    incus network unset "$BRIDGE" ipv4.nat </dev/null >/dev/null 2>&1 || true
+                    save_main_var BRIDGE_IPV4_AUTO 0; BRIDGE_IPV4_AUTO=0
+                    ok "网桥 IPv4 已关闭"; load_conf >/dev/null 2>&1 || true
+                else
+                    printf ' 确认开启网桥 IPv4（自动挑私有网段）? [Y/n]: '; read -r c || return 0
+                    case "$c" in [nN]) info 已取消; continue ;; esac
+                    if incus network set "$BRIDGE" ipv4.address auto </dev/null >/dev/null 2>&1; then
+                        incus network set "$BRIDGE" ipv4.nat true </dev/null >/dev/null 2>&1 || true
+                        save_main_var BRIDGE_IPV4_AUTO 1; BRIDGE_IPV4_AUTO=1; sleep 1
+                        ok "网桥 IPv4 已开启：$(bridge_ipv4 2>/dev/null)"; load_conf >/dev/null 2>&1 || true
+                    else
+                        err "开启失败，请手动检查 incus network show $BRIDGE"
+                    fi
+                fi
+                pause_back ;;
+            2)
+                if [ -n "$b6" ]; then
+                    warn "关闭网桥 IPv6 后，容器的 IPv6 代理与双栈会全部失效"
+                    printf ' 确认关闭? 输入 yes: '; read -r c || return 0
+                    [ "$c" = "yes" ] || { info 已取消; continue; }
+                    incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
+                    incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
+                    save_main_var BRIDGE_IPV6_AUTO 0; BRIDGE_IPV6_AUTO=0
+                    ok "网桥 IPv6 已关闭"; load_conf >/dev/null 2>&1 || true
+                else
+                    printf ' 确认开启网桥 IPv6（ULA，不占公网）? [Y/n]: '; read -r c || return 0
+                    case "$c" in [nN]) info 已取消; continue ;; esac
+                    if incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
+                        incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
+                        save_main_var BRIDGE_IPV6_AUTO 1; BRIDGE_IPV6_AUTO=1; sleep 1
+                        ok "网桥 IPv6 已开启：$(bridge_ipv6 2>/dev/null)"; load_conf >/dev/null 2>&1 || true
+                    else
+                        err "开启失败，请手动检查 incus network show $BRIDGE"
+                    fi
+                fi
+                pause_back ;;
+            3)
+                printf ' 确认开启网桥缺失的地址族? [Y/n]: '; read -r c || return 0
+                case "$c" in [nN]) info 已取消; continue ;; esac
+                if [ -z "$(bridge_ipv4 2>/dev/null)" ]; then
+                    incus network set "$BRIDGE" ipv4.address auto </dev/null >/dev/null 2>&1 && save_main_var BRIDGE_IPV4_AUTO 1 && ok "网桥 IPv4 已开启"
+                fi
+                if [ -z "$(bridge_ipv6 2>/dev/null)" ]; then
+                    if incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
+                        incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
+                        save_main_var BRIDGE_IPV6_AUTO 1; ok "网桥 IPv6 已开启"
+                    fi
+                fi
+                sleep 1; load_conf >/dev/null 2>&1 || true
+                pause_back ;;
+            4)
+                warn "关闭后容器只剩一个地址族，双栈/混合出口会失效"
+                printf ' 确认全部关闭? 输入 yes: '; read -r c || return 0
+                [ "$c" = "yes" ] || { info 已取消; continue; }
+                incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
+                incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
+                save_main_var BRIDGE_IPV6_AUTO 0; BRIDGE_IPV6_AUTO=0
+                if [ "${BRIDGE_IPV4_AUTO:-0}" = "1" ]; then
+                    incus network unset "$BRIDGE" ipv4.address </dev/null >/dev/null 2>&1 || true
+                    incus network unset "$BRIDGE" ipv4.nat </dev/null >/dev/null 2>&1 || true
+                    save_main_var BRIDGE_IPV4_AUTO 0; BRIDGE_IPV4_AUTO=0
+                fi
+                ok "已关闭（不由本脚本开启的地址族保持原样）"
+                load_conf >/dev/null 2>&1 || true
+                pause_back ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+aux_menu() {
+    local a
+    while :; do
+        clear_if_tty
+        title "辅助功能（选择性开启）"
+        printf '    %s[1]%s 网桥地址族（IPv4 / IPv6 开启或关闭）\n' "$GREEN" "$NC"
+        printf '    %s[2]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
+        line
+        printf '请输入选项 [0-2]: '
+        read -r a || return 0
+        case "$a" in
+            0|"") return 0 ;;
+            1) bridge_family_menu ;;
+            2) sec_menu ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
 sec_menu() {
     local c dev a
     while true; do
@@ -1988,10 +2138,14 @@ sec_menu() {
 ' "$GREEN" "$NC"
         printf '    %s[4]%s 指定容器关闭
 ' "$GREEN" "$NC"
+        printf '    %s[5]%s 全部关闭（撤销全部容器的加固）
+' "$GREEN" "$NC"
+        printf '    %s[6]%s 新容器自动加固：%s
+' "$GREEN" "$NC" "$([ "${AUTO_HARDEN:-0}" = "1" ] && echo 已开启 || echo 未开启)"
         printf '    %s[0]%s 返回
 ' "$YELLOW" "$NC"
         line
-        printf '请输入选项 [0-4]: '
+        printf '请输入选项 [0-6]: '
         read -r a || return 0
         case "$a" in
             0|"") return 0 ;;
@@ -2010,6 +2164,22 @@ sec_menu() {
             4)
                 c="$(pick_container)" || { pause_back; continue; }
                 if sec_apply_one "$c" 0; then ok "已为 $c 关闭加固"; else err "$c 设置失败"; fi
+                pause_back
+                ;;
+            5)
+                printf ' 确认关闭 %s 个容器的源 IP 防伪? 输入 yes 继续: ' "$(incus list --format=csv -c n 2>/dev/null | grep -c .)"
+                read -r a || return 0
+                [ "$a" = "yes" ] || { info "已取消"; pause_back; continue; }
+                sec_apply_all 0; pause_back
+                ;;
+            6)
+                if [ "${AUTO_HARDEN:-0}" = "1" ]; then
+                    save_main_var AUTO_HARDEN 0; AUTO_HARDEN=0
+                    info "已关闭：新容器不再自动加固"
+                else
+                    save_main_var AUTO_HARDEN 1; AUTO_HARDEN=1
+                    ok "已开启：定时器会给新容器自动加固（按宿主机协议族）"
+                fi
                 pause_back
                 ;;
             *) echo "无效选择"; sleep 1 ;;
@@ -2160,9 +2330,11 @@ doctor() {
         check_item "mark 段无冲突" 0 "0x1000-0x1fff 归本脚本专用"
     fi
     if [ -f "$BIND_CONF" ] && has_cmd incus; then
-        local bc nofilter=""
+        local bc nofilter="" live
+        live="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"')"
         while IFS='|' read -r bc _ _ _; do
             case "$bc" in ''|'#'*) continue ;; esac
+            printf '%s\n' "$live" | grep -qxF "$bc" || continue
             incus config show "$bc" 2>/dev/null | grep -q 'ipv4_filtering: "true"' || nofilter="$nofilter $bc"
         done < "$BIND_CONF"
         if [ -n "$nofilter" ]; then
@@ -2172,6 +2344,16 @@ doctor() {
         else
             check_item "容器源 IP 防伪" 0 "已绑定容器均开启 ipv4_filtering"
         fi
+    fi
+    local _auth _live2 _ghost
+    _auth="$(grep -v '^#' "$CLIENT_ALLOW_CONF" 2>/dev/null | sed '/^$/d' | cut -d'|' -f1)"
+    _live2="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"')"
+    _ghost="$(printf '%s\n' "$_auth" | grep -vxF "$_live2" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "${_ghost:-0}" -gt 0 ]; then
+        printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "失效授权记录" "$_ghost 个（容器已删除）"
+        info "处理：菜单 [10] → [11] 一键清理，或下次自动校验时自动清掉"
+    else
+        check_item "授权记录" 0 "无失效记录"
     fi
     subline
     info "出口 $(exits_count) 个，绑定 $(grep -v '^#' "$BIND_CONF" 2>/dev/null | grep -c '|' || true) 个容器"
@@ -2498,79 +2680,49 @@ exit_add_extend() {
     # 本机某个家族只能直出时，用远端节点补另一个家族，凑成双栈出口
     local b4 b6 g4 g6 localfam remfam name proto method pass host port m msel methods i reason mark expect
     clear_if_tty
-    title "IPv4 / IPv6 拓展"
-    b6="$(bridge_ipv6 2>/dev/null)"
+    title "新增混合出口（本机直出一族 + 远端出另一族）"
+    b4="$(bridge_ipv4 2>/dev/null)"; b6="$(bridge_ipv6 2>/dev/null)"
     g4=0; g6=0
     ip -4 route show default 2>/dev/null | grep -q default && g4=1
     ip -6 route show default 2>/dev/null | grep -q default && g6=1
-    b4="$(bridge_ipv4 2>/dev/null)"
     printf '  %-22s %s\n' "宿主机 IPv4 出网" "$([ "$g4" = 1 ] && echo 有 || echo 无)"
     printf '  %-22s %s\n' "宿主机 IPv6 出网" "$([ "$g6" = 1 ] && echo 有 || echo 无)"
     printf '  %-22s %s\n' "网桥 IPv4" "${b4:-未启用}"
     printf '  %-22s %s\n' "网桥 IPv6" "${b6:-未启用}"
     subline
     if [ "$g4" = "0" ] && [ "$g6" = "0" ]; then
-        err "本机既没有 IPv4 也没有 IPv6 出网，无法做拓展"
+        err "本机既没有 IPv4 也没有 IPv6 出网，无法做混合出口"
         pause_back; return 1
     fi
     if [ "$g4" = "1" ] && [ "$g6" = "1" ]; then
-        info "本机已是双栈，直接新增普通出口即可，不需要拓展"
-        pause_back; return 1
-    fi
-    # 只有单栈时：本机直出一个家族，缺的那个家族由远端补；容器必须有缺的那族的地址
-    if [ "$g4" = "1" ]; then
+        info "本机是双栈：可以保留一族直出，让远端只出另一族"
+        printf '  选择本机直出的地址族（另一族交给远端）:\n'
+        printf '    %s[1]%s IPv4 本机直出，远端出 IPv6\n' "$GREEN" "$NC"
+        printf '    %s[2]%s IPv6 本机直出，远端出 IPv4\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
+        printf '请输入 [0-2]: '; read -r fs1 || return 0
+        case "$fs1" in
+            0|"") info "已取消"; return 0 ;;
+            2) localfam="v6"; remfam="v4" ;;
+            *) localfam="v4"; remfam="v6" ;;
+        esac
+    elif [ "$g4" = "1" ]; then
         localfam="v4"; remfam="v6"
-        if [ -z "$b6" ]; then
-            warn "网桥没有 IPv6 地址：容器不会有 IPv6 流量，拓展无从生效"
-            info "需要给网桥开一段 ULA（不占用公网地址），命令是："
-            info "  incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
-            info "  incus network set $BRIDGE ipv6.nat true"
-            printf '是否现在自动执行？[y/N]: '; read -r a6 || return 0
-            case "$a6" in
-                y|Y) ;;
-                *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
-            esac
-            info "正在给网桥开启 IPv6 ..."
-            if ! incus network set "$BRIDGE" ipv6.address "fd42:1:1::1/64" </dev/null >/dev/null 2>&1; then
-                err "开启失败：incus network set $BRIDGE ipv6.address fd42:1:1::1/64"
-                pause_back; return 1
-            fi
-            incus network set "$BRIDGE" ipv6.nat true </dev/null >/dev/null 2>&1 || true
-            sleep 2
-            b6="$(bridge_ipv6 2>/dev/null)"
-            [ -n "$b6" ] || { err "已执行命令但没取到网桥 IPv6，请检查 incus network show $BRIDGE"; pause_back; return 1; }
-            save_main_var BRIDGE_IPV6_AUTO 1
-            ok "网桥 IPv6 已开启：$b6"
-            info "删除最后一个拓展节点时会自动还原"
-        fi
-        info "本机有 IPv4：IPv4 走本机直出，远端节点补 IPv6 出站"
+        info "本机只有 IPv4：IPv4 走本机直出，远端补 IPv6 出站"
     else
         localfam="v6"; remfam="v4"
-        if [ -z "$b4" ]; then
-            warn "网桥没有 IPv4 地址：容器不会有 IPv4 流量，拓展无从生效"
-            info "需要给网桥开一段私有 IPv4（不占用公网地址），命令是："
-            info "  incus network set $BRIDGE ipv4.address auto"
-            info "  incus network set $BRIDGE ipv4.nat true"
-            printf '是否现在自动执行？[y/N]: '; read -r a4 || return 0
-            case "$a4" in
-                y|Y) ;;
-                *) info "已取消（可稍后手动执行上面的命令）"; pause_back; return 0 ;;
-            esac
-            info "正在给网桥开启 IPv4 ..."
-            if ! incus network set "$BRIDGE" ipv4.address auto </dev/null >/dev/null 2>&1; then
-                err "开启失败：incus network set $BRIDGE ipv4.address auto"
-                pause_back; return 1
-            fi
-            incus network set "$BRIDGE" ipv4.nat true </dev/null >/dev/null 2>&1 || true
-            sleep 2
-            b4="$(bridge_ipv4 2>/dev/null)"
-            [ -n "$b4" ] || { err "已执行命令但没取到网桥 IPv4，请检查 incus network show $BRIDGE"; pause_back; return 1; }
-            save_main_var BRIDGE_IPV4_AUTO 1
-            load_conf >/dev/null 2>&1 || true
-            ok "网桥 IPv4 已开启：$b4"
-            info "删除最后一个拓展节点时会自动还原"
-        fi
-        info "本机只有 IPv6：IPv6 走本机直出，远端节点补 IPv4 出站"
+        info "本机只有 IPv6：IPv6 走本机直出，远端补 IPv4 出站"
+    fi
+    # 网桥必须有"远端那一族"的地址，否则容器产生不了该族流量
+    if [ "$remfam" = "v6" ] && [ -z "$b6" ]; then
+        err "网桥没有 IPv6 地址：容器不会有 IPv6 流量，混合出口无从生效"
+        info "请先到 菜单 [17] → [1] 辅助功能 · 网桥地址族 里开启网桥 IPv6，再回来做。";
+        pause_back; return 1
+    fi
+    if [ "$remfam" = "v4" ] && [ -z "$b4" ]; then
+        err "网桥没有 IPv4 地址：容器不会有 IPv4 流量，混合出口无从生效"
+        info "请先到 菜单 [17] → [1] 辅助功能 · 网桥地址族 里开启网桥 IPv4，再回来做。";
+        pause_back; return 1
     fi
     subline
     printf '节点名称（如 双栈-拓展，输入 0 取消）: '; read -r name || return 0
@@ -2639,7 +2791,7 @@ exit_add_extend() {
     printf '%s|1|direct||0|||%s|auto\n' "$name" "$localfam" >> "$LOGIC_CONF"
     printf '%s|2|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$remfam" "$localfam" >> "$LOGIC_CONF"
     printf '%s|logic||0|||%s||||%s|1|\n' "$name" "$mark" "$expect" >> "$EXITS_CONF"
-    ok "已新增拓展节点 $name（$(proto_label "$proto") 补 $remfam，mark $mark）"
+    ok "已新增混合出口 $name（$(proto_label "$proto") 补 $remfam，mark $mark）"
     info "IPv$([ "$localfam" = v4 ] && echo 4 || echo 6) 目标走本机直出；IPv$([ "$remfam" = v4 ] && echo 4 || echo 6) 目标走远端节点"
     info "正在下发规则 ..."
     apply_all
@@ -2658,8 +2810,8 @@ exit_add() {
             printf '  %s[1]%s Shadowsocks 2022（推荐）\n' "$GREEN" "$NC"
             printf '  %s[2]%s Shadowsocks（经典版）\n' "$GREEN" "$NC"
             printf '  %s[3]%s WireGuard\n' "$GREEN" "$NC"
-            printf '  %s[4]%s 逻辑节点（多台机器拼 IPv4 + IPv6）\n' "$GREEN" "$NC"
-            printf '  %s[5]%s IPv4 / IPv6 拓展（本机直出 + 远端补另一个家族）\n' "$GREEN" "$NC"
+            printf '  %s[4]%s 逻辑节点（2 台机器拼 IPv4 + IPv6）\n' "$GREEN" "$NC"
+            printf '  %s[5]%s 混合出口（本机直出一族 + 远端出另一族）\n' "$GREEN" "$NC"
             printf '  %s[0]%s 返回上一级\n' "$YELLOW" "$NC"
             printf '请输入 [0-5]: '
             read -r proto_sel || return 0
@@ -2899,7 +3051,7 @@ exit_del() {
     mv -f "$BIND_CONF.tmp" "$BIND_CONF"
         logic_del_node "$name" 2>/dev/null || true
     ok "已删除 $name，相关绑定已解除"
-    maybe_revert_bridge_ipv6
+    # 网桥地址族由 菜单 [17] → [1] 管理，这里不再自动关闭
     apply_all >/dev/null 2>&1
     pause_back
 }
@@ -3192,9 +3344,10 @@ client_menu() {
         else
             printf '    %s[10]%s 新容器自动授权：%s未开启%s\n' "$GREEN" "$NC" "$YELLOW" "$NC"
         fi
+        printf '    %s[11]%s 清理失效记录（已删除的容器）\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
-        printf '请输入选项 [0-10]: '
+        printf '请输入选项 [0-11]: '
         read -r c || return 0
         case "$c" in
             1) client_status; pause_back ;;
@@ -3207,6 +3360,7 @@ client_menu() {
             8) sync_timer_off; pause_back ;;
             9) client_update_base ;;
             10) auto_grant_toggle; pause_back ;;
+            11) clients_prune; bindings_refresh; apply_nft_only >/dev/null 2>&1; ok "清理完成"; pause_back ;;
             0) return 0 ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
@@ -3293,7 +3447,7 @@ menu_main() {
         printf '  %s【环境】%s\n' "$CYAN" "$NC"
         printf '    %s[15]%s 依赖安装（分类选择）\n' "$GREEN" "$NC"
         printf '    %s[16]%s 检查并更新脚本（GitHub）\n' "$GREEN" "$NC"
-        printf '    %s[17]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
+        printf '    %s[17]%s 辅助功能（网桥地址族 / 安全加固）\n' "$GREEN" "$NC"
         printf '    %s[99]%s 一键卸载 Incus MultiRoute\n' "$RED" "$NC"
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$RED" "$NC"
@@ -3317,7 +3471,7 @@ menu_main() {
             14) install_self ;;
             15) deps_menu ;;
             16) update_menu ;;
-            17) sec_menu ;;
+            17) aux_menu ;;
             99) uninstall_all ;;
             0) printf '%s再见%s\n' "$YELLOW" "$NC"; exit 0 ;;
             *) echo "无效选择"; sleep 1 ;;
