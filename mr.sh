@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.4
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.5
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.4"
+SCRIPT_VERSION="3.4.5"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -497,31 +497,6 @@ gen_nft() {
     } > "$NFT_FILE"
 }
 
-maybe_revert_bridge_ipv6() {
-    # 只有"网桥地址族是本脚本为拓展节点开的"才还原；别人配的不动
-    local did=0
-    if [ -f "$LOGIC_CONF" ] && grep -q '|direct|' "$LOGIC_CONF" 2>/dev/null; then
-        return 0   # 还有拓展节点，保持开启
-    fi
-    if [ "${BRIDGE_IPV6_AUTO:-0}" = "1" ]; then
-        info "没有拓展节点了，把网桥 IPv6 还原成原来的状态 ..."
-        incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
-        incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
-        save_main_var BRIDGE_IPV6_AUTO 0
-        ok "网桥 IPv6 已还原（$BRIDGE 不再有 IPv6 地址）"
-        did=1
-    fi
-    if [ "${BRIDGE_IPV4_AUTO:-0}" = "1" ]; then
-        info "没有拓展节点了，把网桥 IPv4 还原成原来的状态 ..."
-        incus network unset "$BRIDGE" ipv4.address </dev/null >/dev/null 2>&1 || true
-        incus network unset "$BRIDGE" ipv4.nat </dev/null >/dev/null 2>&1 || true
-        save_main_var BRIDGE_IPV4_AUTO 0
-        ok "网桥 IPv4 已还原（$BRIDGE 不再有 IPv4 地址）"
-        did=1
-    fi
-    [ "$did" = "1" ] && load_conf >/dev/null 2>&1 || true
-    return 0
-}
 
 logic_members() {  # $1=节点名
     [ -f "$LOGIC_CONF" ] || return 0
@@ -2383,7 +2358,7 @@ doctor() {
         if [ -n "$nofilter" ]; then
             printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv4_filtering" "$nofilter"
             info "这些容器可以伪造源 IP 发包（反射攻击 / 日志污染）"
-            info "处理：菜单 [17] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
+            info "处理：菜单 [17] → [2] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
         else
             check_item "容器源 IP 防伪" 0 "已绑定容器均开启 ipv4_filtering"
         fi
