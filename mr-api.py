@@ -104,28 +104,77 @@ def load_allow():
 _LOOKUP = {"ts": 0.0, "map": {}}
 
 
-def incus_ip_map():
-    """从 incus 实时取 容器IP -> 容器名 映射（5 秒缓存）。
+def _bridge_cidr():
+    """网桥网段（如 10.10.0.0/22）；取不到返回 None。"""
+    try:
+        bridge = "incusbr0"
+        try:
+            with open(os.path.join(CONF_DIR, "mr.conf"), "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"^BRIDGE=\"?([A-Za-z0-9_.-]+)\"?", line.strip())
+                    if m:
+                        bridge = m.group(1)
+                        break
+        except OSError:
+            pass
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", bridge],
+                             capture_output=True, timeout=5).stdout.decode("utf-8", "ignore")
+        mm = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
+        if mm:
+            return ipaddress.ip_network(mm.group(1), strict=False)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
-    绑定表里没有记录时用它兜底，避免"授权了但没绑定"就直接 403。
+
+def incus_ip_map():
+    """容器IP -> 容器名（5 秒缓存）。
+
+    用 incus 的 JSON 输出：CSV 会把**容器内部**的网卡（wg0 等）也列出来、
+    多地址时字段内还含换行，逐行解析会错位 → 认错容器 → 令牌校验失败。
     """
     now = time.time()
     if now - _LOOKUP["ts"] < 5 and _LOOKUP["map"]:
         return _LOOKUP["map"]
     m = {}
+    net = _bridge_cidr()
     try:
-        out = subprocess.run(["incus", "list", "--format=csv", "-c", "n4"],
+        raw = subprocess.run(["incus", "list", "--format=json"],
                              capture_output=True, timeout=10).stdout
-        for line in out.decode("utf-8", "ignore").splitlines():
-            parts = line.split(",")
-            if len(parts) < 2:
-                continue
-            ip = parts[1].replace('"', "").split(" (")[0].strip().split(" ")[0]
-            name = parts[0].replace('"', "").strip()
-            if ip and name:
-                m[ip] = name
+        data = json.loads(raw or b"[]")
     except Exception:  # noqa: BLE001
         return _LOOKUP["map"]
+    for c in data:
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        ips = []
+        nw = (c.get("state") or {}).get("network") or {}
+        # 结构是 {"eth0": {"addresses": [{"family":"inet","address":...}, ...]}}
+        for _iface, info in (nw.items() if isinstance(nw, dict) else []):
+            if not isinstance(info, dict):
+                continue
+            for it in info.get("addresses") or []:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("family") != "inet":
+                    continue
+                a = (it.get("address") or "").strip()
+                if a and not a.startswith("127."):
+                    ips.append(a)
+        if not ips:
+            continue
+        pick = None
+        if net is not None:
+            for a in ips:
+                try:
+                    if ipaddress.ip_address(a) in net:
+                        pick = a
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+        ip = pick or ips[0]
+        m[ip] = name
     _LOOKUP["ts"] = now
     _LOOKUP["map"] = m
     return m
@@ -261,15 +310,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def auth(self):
         ip = self.client_ip()
+        token = self.headers.get("X-Egress-Token", "")
         name = container_by_ip(ip)
+        if not name and token:
+            # 兜底：IP 认不出容器时（多网卡/容器重建/绑定表过期），用令牌反查
+            for cand, tk in load_tokens().items():
+                if tk and hmac.compare_digest(token, tk):
+                    name = cand
+                    break
         if not name:
             self.jreply({"ok": False,
-                         "error": "未识别的容器来源 %s：该容器还没有身份记录，请管理员在菜单 [6] 绑定，或 [9] 重新授权" % ip}, 403)
+                         "error": "未识别的容器来源 %s：该容器还没有身份记录，请管理员在菜单 [7] 绑定，或 [10] → [2] 重新授权" % ip}, 403)
             return None
         if name not in load_allow():
             self.jreply({"ok": False, "error": "该容器未获授权使用 out"}, 403)
             return None
-        token = self.headers.get("X-Egress-Token", "")
         expect = load_tokens().get(name, "")
         if not expect or not hmac.compare_digest(token, expect):
             self.jreply({"ok": False, "error": "令牌无效"}, 403)

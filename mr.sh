@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.6
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.7
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.6"
+SCRIPT_VERSION="3.4.7"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -286,31 +286,54 @@ bridge_ipv4() {
 }
 
 container_ip6() {
-    # 容器的全局/ULA IPv6（跳过 fe80）
-    local name="$1"
+    # 容器的 IPv6，优先网桥前缀内的（容器里可能还有 wg0 的公网 v6）
+    local name="$1" b6 pre a first best ips
+    b6="$(bridge_ipv6 2>/dev/null)"
+    pre=""
+    [ -n "$b6" ] && pre="${b6%::*}"
+    if has_cmd jq && has_cmd incus; then
+        ips="$(incus list --format=json 2>/dev/null | jq -r --arg n "$name" '.[] | select(.name==$n) | [.state.network[]?.addresses[]? | select(.family=="inet6") | select(.scope!="link") | .address] | join(" ")' 2>/dev/null)"
+        first=""; best=""
+        for a in $ips; do
+            [ -n "$first" ] || first="$a"
+            if [ -n "$pre" ] && [ "${a#"$pre"}" != "$a" ]; then best="$a"; break; fi
+        done
+        [ -n "$best" ] || best="$first"
+        [ -n "$best" ] && echo "$best"
+        return 0
+    fi
     incus list --format=csv -c n6 2>/dev/null | awk -F, -v n="$name" '
-        $1 == n {
-            ip = $2; gsub(/"/, "", ip); sub(/ *\(.*/, "", ip)
-            c = split(ip, a, " ")
-            for (i = 1; i <= c; i++) {
-                if (a[i] ~ /^fe80:/) continue
-                if (a[i] ~ /:/) { print a[i]; exit }
-            }
-        }'
+        $1 == n { s = $2; gsub(/"/, "", s); c = split(s, a, /[ \t]+/);
+            for (i = 1; i <= c; i++) { t = a[i]; if (t == "" || t ~ /^\(/) continue;
+                if (t !~ /:/) continue; if (t ~ /^fe80:/) continue; print t; exit } }'
 }
 
 containers_scan() {
-    # 输出：容器名<TAB>IPv4
+    # 输出：容器名<TAB>IPv4（优先网桥网段内的地址）
+    # 用 incus JSON + jq：CSV 会把容器内部网卡（wg0 等）也列出来，且多地址含换行，逐行解析会错位
     has_cmd incus || return 1
-    # 容器可能有多张网卡/多个地址：优先取网桥网段内的地址
-    # （否则用户在容器里加个 dummy 地址，就会把绑定记录带偏）
     local cidr n ips a best first
     cidr="$(detect_subnet 2>/dev/null)"
+    if has_cmd jq; then
+        while IFS=$'\t' read -r n ips; do
+            [ -n "$n" ] || continue
+            best=""; first=""
+            for a in $ips; do
+                [ -n "$first" ] || first="$a"
+                if [ -n "$cidr" ] && in_bridge_subnet "$a" "$cidr"; then best="$a"; break; fi
+            done
+            [ -n "$best" ] || best="$first"
+            [ -n "$best" ] && printf '%s\t%s\n' "$n" "$best"
+        done < <(incus list --format=json 2>/dev/null | jq -r '.[] | "\(.name)\t\([.state.network[]?.addresses[]? | select(.family=="inet") | .address] | join(" "))"' 2>/dev/null)
+        return 0
+    fi
+    # 没有 jq 的兜底：CSV 单行解析（多网卡容器可能取错）
     while IFS=, read -r n ips; do
         n="${n//\"/}"; ips="${ips//\"/}"
-        ips="${ips%%(*}"
         best=""; first=""
         for a in $ips; do
+            case "$a" in "("*) continue ;; esac
+            case "$a" in *:*|'') continue ;; esac
             [ -n "$first" ] || first="$a"
             if [ -n "$cidr" ] && in_bridge_subnet "$a" "$cidr"; then best="$a"; break; fi
         done
@@ -1792,14 +1815,22 @@ update_menu() {
         fi
     fi
     rm -rf "$tmp"
+    # 校验落盘版本，避免"显示更新成功但实际还是旧文件"
+    local nowver
+    nowver="$(grep -m1 'SCRIPT_VERSION=' /usr/local/bin/mr 2>/dev/null | cut -d'"' -f2)"
+    if [ "$nowver" != "$rv" ]; then
+        err "落盘版本是 v${nowver:-未知}，不是 v$rv（可能被其它进程覆盖）"
+        pause_back
+        return 1
+    fi
     ok "已更新到 v$rv"
     info "旧版本备份: $SELF_PATH.bak.*"
     info "配置未改动"
-    # 直接换成新版本继续跑，不用退出再 mr
-    if [ -x /usr/local/bin/mr ]; then
+    # 直接用新文件重开菜单（bash 显式执行，避免 shebang / noexec 等意外）
+    if [ -f /usr/local/bin/mr ]; then
         info "正在用新版本重新打开菜单 ..."
         sleep 1
-        exec /usr/local/bin/mr
+        exec bash /usr/local/bin/mr
     fi
     pause_back
 }
@@ -2352,6 +2383,24 @@ doctor() {
         info "本脚本只用 0x1000-0x1fff；上面若有重叠，先协调再下发，避免抢路由"
     else
         check_item "mark 段无冲突" 0 "0x1000-0x1fff 归本脚本专用"
+    fi
+    # 绑定 IP 是否落在网桥网段（容器多网卡时容易绑错，导致代理不生效 + API 认不出身份）
+    if [ -f "$BIND_CONF" ]; then
+        local _bn _bip _bex _bmk _cidr _badip=""
+        _cidr="$(detect_subnet 2>/dev/null)"
+        if [ -n "$_cidr" ]; then
+            while IFS='|' read -r _bn _bip _bex _bmk; do
+                case "$_bn" in ''|'#'*) continue ;; esac
+                case "$_bip" in ''|*[!0-9.]*) continue ;; esac
+                in_bridge_subnet "$_bip" "$_cidr" || _badip="$_badip $_bn($_bip)"
+            done < "$BIND_CONF"
+            if [ -n "$_badip" ]; then
+                printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "绑定 IP 不在网桥网段" "$_badip"
+                info "这些容器有额外网卡（wg0 等）导致取错地址：执行 [9] 校正 后重新下发即可修复"
+            else
+                check_item "绑定 IP 归属" 0 "均在网桥网段内"
+            fi
+        fi
     fi
     if [ -f "$BIND_CONF" ] && has_cmd incus; then
         local bc nofilter="" live

@@ -174,7 +174,16 @@ print_current() {
     raw="$(state_json)"
     container="$(printf '%s' "$raw" | json_value container)"
     current="$(printf '%s' "$raw" | json_value current)"
-    [ -n "$container" ] || { echo "无法读取容器状态，请检查 API/token。"; return 1; }
+    if [ -z "$container" ]; then
+        # 把 API 返回的原因原样带出来，避免一律提示"检查 API/token"误导排查
+        err="$(printf '%s' "$raw" | json_value error)"
+        if [ -n "$err" ]; then
+            echo "无法读取容器状态：$err"
+        else
+            echo "无法读取容器状态：宿主机 API 无响应（检查 18988 端口与容器到网桥的连通性）"
+        fi
+        return 1
+    fi
     printf '容器: %s\n' "$container"
     printf '当前出口: %s%s%s\n' "$C_GREEN" "$(display_exit "${current:-}")" "$C_RESET"
 }
@@ -526,7 +535,11 @@ exit_test() {
     raw="$(state_json)"
     current="$(printf '%s' "$raw" | json_value current)"
     container="$(printf '%s' "$raw" | json_value container)"
-    [ -n "$container" ] || { echo "无法读取容器状态，请检查 API/token。"; return 1; }
+    if [ -z "$container" ]; then
+        err="$(printf '%s' "$raw" | json_value error)"
+        [ -n "$err" ] && echo "无法读取容器状态：$err" || echo "无法读取容器状态：宿主机 API 无响应"
+        return 1
+    fi
     [ -n "$target" ] || target="$current"
     [ -n "$target" ] || { echo "当前没有可测试的出口。"; return 1; }
     if ! printf '%s' "$raw" | json_exits | grep -qx "$target"; then
