@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.3
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.4
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.3"
+SCRIPT_VERSION="3.4.4"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -2002,11 +2002,12 @@ sec_apply_all() {
 }
 
 bridge_family_menu() {
-    local a c b4 b6 g4 g6
+    local a c b4 b6 g4 g6 own4 own6 l4 l6
     while :; do
         clear_if_tty
         title "辅助功能 · 网桥地址族"
         b4="$(bridge_ipv4 2>/dev/null)"; b6="$(bridge_ipv6 2>/dev/null)"
+        own4="${BRIDGE_IPV4_AUTO:-0}"; own6="${BRIDGE_IPV6_AUTO:-0}"
         g4=0; g6=0
         ip -4 route show default 2>/dev/null | grep -q default && g4=1
         ip -6 route show default 2>/dev/null | grep -q default && g6=1
@@ -2015,10 +2016,28 @@ bridge_family_menu() {
         printf '  %-22s %s\n' "网桥 IPv4（$BRIDGE）" "${b4:-未启用}"
         printf '  %-22s %s\n' "网桥 IPv6（$BRIDGE）" "${b6:-未启用}"
         subline
-        printf '    %s[1]%s 网桥 IPv4：%s\n' "$GREEN" "$NC" "$([ -n "$b4" ] && echo 关闭 || echo 开启)"
-        printf '    %s[2]%s 网桥 IPv6：%s\n' "$GREEN" "$NC" "$([ -n "$b6" ] && echo 关闭 || echo 开启)"
-        printf '    %s[3]%s 全部开启（缺哪个开哪个）\n' "$GREEN" "$NC"
-        printf '    %s[4]%s 全部关闭（只关本脚本开启的）\n' "$GREEN" "$NC"
+        if [ -n "$b4" ] && [ "$own4" != "1" ]; then
+            l4="由 Incus 原生提供 —— 不可关闭"
+        elif [ -n "$b4" ]; then
+            l4="关闭（本脚本开启的）"
+        else
+            l4="开启"
+        fi
+        if [ -n "$b6" ] && [ "$own6" != "1" ]; then
+            l6="由 Incus 原生提供 —— 不可关闭"
+        elif [ -n "$b6" ]; then
+            l6="关闭（本脚本开启的）"
+        else
+            l6="开启"
+        fi
+        printf '    %s[1]%s 网桥 IPv4：%s\n' "$GREEN" "$NC" "$l4"
+        printf '    %s[2]%s 网桥 IPv6：%s\n' "$GREEN" "$NC" "$l6"
+        if [ -n "$b4" ] && [ -n "$b6" ]; then
+            printf '    %s[3]%s 全部开启（当前两个地址族都已存在，无需操作）\n' "$YELLOW" "$NC"
+        else
+            printf '    %s[3]%s 全部开启（只开缺失的地址族）\n' "$GREEN" "$NC"
+        fi
+        printf '    %s[4]%s 关闭新增网桥（只关本脚本开启的）\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
         line
         printf '请输入选项 [0-4]: '
@@ -2026,6 +2045,11 @@ bridge_family_menu() {
         case "$a" in
             0|"") return 0 ;;
             1)
+                if [ -n "$b4" ] && [ "$own4" != "1" ]; then
+                    err "网桥 IPv4（$b4）是 Incus 原生配置，脚本不允许关闭"
+                    info "只有由本脚本（本菜单）开启的地址族才可关闭，避免影响 incus 自身"
+                    pause_back; continue
+                fi
                 if [ -n "$b4" ]; then
                     warn "关闭网桥 IPv4 后，容器的 IPv4 代理与绑定会全部失效"
                     printf ' 确认关闭? 输入 yes: '; read -r c || return 0
@@ -2047,6 +2071,11 @@ bridge_family_menu() {
                 fi
                 pause_back ;;
             2)
+                if [ -n "$b6" ] && [ "$own6" != "1" ]; then
+                    err "网桥 IPv6（$b6）是 Incus 原生配置，脚本不允许关闭"
+                    info "只有由本脚本（本菜单）开启的地址族才可关闭，避免影响 incus 自身"
+                    pause_back; continue
+                fi
                 if [ -n "$b6" ]; then
                     warn "关闭网桥 IPv6 后，容器的 IPv6 代理与双栈会全部失效"
                     printf ' 确认关闭? 输入 yes: '; read -r c || return 0
@@ -2068,6 +2097,10 @@ bridge_family_menu() {
                 fi
                 pause_back ;;
             3)
+                if [ -n "$b4" ] && [ -n "$b6" ]; then
+                    info "网桥 IPv4 与 IPv6 都已存在，无需开启"
+                    pause_back; continue
+                fi
                 printf ' 确认开启网桥缺失的地址族? [Y/n]: '; read -r c || return 0
                 case "$c" in [nN]) info 已取消; continue ;; esac
                 if [ -z "$(bridge_ipv4 2>/dev/null)" ]; then
@@ -2082,18 +2115,28 @@ bridge_family_menu() {
                 sleep 1; load_conf >/dev/null 2>&1 || true
                 pause_back ;;
             4)
-                warn "关闭后容器只剩一个地址族，双栈/混合出口会失效"
-                printf ' 确认全部关闭? 输入 yes: '; read -r c || return 0
+                if [ "$own4" != "1" ] && [ "$own6" != "1" ]; then
+                    info "没有由本脚本开启的网桥地址族，无需关闭"
+                    info "（Incus 原生提供的 IPv4/IPv6 永远不受本菜单影响）"
+                    pause_back; continue
+                fi
+                printf ' 将关闭本脚本开启的：%s%s\n' \
+                    "$([ "$own4" = "1" ] && echo "IPv4 ")" "$([ "$own6" = "1" ] && echo "IPv6 ")"
+                warn "关闭后容器会失去对应地址族，双栈/混合出口随之失效"
+                printf ' 确认关闭? 输入 yes: '; read -r c || return 0
                 [ "$c" = "yes" ] || { info 已取消; continue; }
-                incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
-                incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
-                save_main_var BRIDGE_IPV6_AUTO 0; BRIDGE_IPV6_AUTO=0
-                if [ "${BRIDGE_IPV4_AUTO:-0}" = "1" ]; then
+                if [ "$own6" = "1" ]; then
+                    incus network unset "$BRIDGE" ipv6.address </dev/null >/dev/null 2>&1 || true
+                    incus network unset "$BRIDGE" ipv6.nat </dev/null >/dev/null 2>&1 || true
+                    save_main_var BRIDGE_IPV6_AUTO 0; BRIDGE_IPV6_AUTO=0; own6=0
+                    ok "网桥 IPv6 已关闭（本脚本开启的）"
+                fi
+                if [ "$own4" = "1" ]; then
                     incus network unset "$BRIDGE" ipv4.address </dev/null >/dev/null 2>&1 || true
                     incus network unset "$BRIDGE" ipv4.nat </dev/null >/dev/null 2>&1 || true
-                    save_main_var BRIDGE_IPV4_AUTO 0; BRIDGE_IPV4_AUTO=0
+                    save_main_var BRIDGE_IPV4_AUTO 0; BRIDGE_IPV4_AUTO=0; own4=0
+                    ok "网桥 IPv4 已关闭（本脚本开启的）"
                 fi
-                ok "已关闭（不由本脚本开启的地址族保持原样）"
                 load_conf >/dev/null 2>&1 || true
                 pause_back ;;
             *) echo "无效选择"; sleep 1 ;;
