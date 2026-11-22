@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.13
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.14
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -46,7 +46,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.13"
+SCRIPT_VERSION="3.4.14"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -2224,6 +2224,13 @@ sec_flag() {  # $1=容器 $2=设备 $3=ipv4_filtering|ipv6_filtering  → 输出
     incus config device get "$1" "$2" "security.$3" 2>/dev/null
 }
 
+v6_filter_available() {
+    # Incus 的 security.ipv6_filtering 要求 net.bridge.bridge-nf-call-ip6tables=1，
+    # 而 TPROXY 必须把它设为 0（否则桥接帧被 ip6tables 劫持，透明代理失效）
+    # → 两者互斥：本机跑着 TPROXY 时，IPv6 源地址过滤不可用
+    [ "$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)" = "1" ]
+}
+
 sec_apply_one() {  # $1=容器  $2=1 开启 / 0 关闭
     local c="$1" mode="$2" dev rc=0 k
     dev="$(container_nic_dev "$c")"
@@ -2231,7 +2238,11 @@ sec_apply_one() {  # $1=容器  $2=1 开启 / 0 关闭
         # 判据是"网桥有没有这一族"：容器能发该族的包，就有伪造该族的风险
         case "$k" in
             ipv4_filtering) [ -n "$(bridge_ipv4 2>/dev/null)" ] || continue ;;
-            ipv6_filtering) [ -n "$(bridge_ipv6 2>/dev/null)" ] || continue ;;
+            ipv6_filtering)
+                [ -n "$(bridge_ipv6 2>/dev/null)" ] || continue
+                # $2=0（关闭）时总要尝试清理；$2=1 时若被 TPROXY 限制就跳过
+                [ "$mode" = "0" ] || v6_filter_available || continue
+                ;;
         esac
         if [ "$mode" = "1" ]; then
             incus config device set "$c" "$dev" "security.$k" true >/dev/null 2>&1 || rc=1
@@ -2245,7 +2256,8 @@ sec_apply_one() {  # $1=容器  $2=1 开启 / 0 关闭
 sec_status_table() {
     local c dev v4 v6 f4 f6 line
     if ! host_has_ipv4; then f4="(宿主机无 IPv4)"; fi
-    if ! host_has_ipv6; then f6="(宿主机无 IPv6)"; fi
+    if ! host_has_ipv6; then f6="(宿主机无 IPv6)";
+    elif ! v6_filter_available; then f6="(TPROXY 限制·不可用)"; fi
     printf '  %-22s %-16s %-16s
 ' "容器" "IPv4 防伪" "IPv6 防伪"
     subline
@@ -2270,6 +2282,10 @@ sec_apply_all() {
     fi
     title "安全加固 · $([ "$mode" = "1" ] && echo 开启 || echo 关闭)"
     info "将处理: $(host_has_ipv4 && printf 'IPv4 ') $(host_has_ipv6 && printf 'IPv6 ')"
+    if [ "$mode" = "1" ] && [ -n "$(bridge_ipv6 2>/dev/null)" ] && ! v6_filter_available; then
+        warn "IPv6 源地址过滤在本机不可用：Incus 要求 net.bridge.bridge-nf-call-ip6tables=1，"
+        info "而 TPROXY 必须把它设为 0 —— 两者互斥，已跳过 ipv6_filtering（IPv4 不受影响）"
+    fi
     if ! host_has_ipv6; then info "宿主机没有 IPv6 默认路由，跳过 ipv6_filtering"; fi
     if ! host_has_ipv4; then info "宿主机没有 IPv4 默认路由，跳过 ipv4_filtering"; fi
     subline
@@ -2463,6 +2479,9 @@ sec_menu() {
         printf '  %s宿主出网族%s  IPv4: %s   IPv6: %s
 ' "$BLUE" "$NC" \
             "$(host_has_ipv4 && echo 有 || echo 无)" "$(host_has_ipv6 && echo 有 || echo 无)"
+        if [ -n "$(bridge_ipv6 2>/dev/null)" ] && ! v6_filter_available; then
+            warn "IPv6 源地址过滤不可用：Incus 要求 bridge-nf-call-ip6tables=1，而 TPROXY 要求 =0（互斥）"
+        fi
         info "加固内容: 禁止容器伪造源 IP（security.ipv4_filtering / security.ipv6_filtering）"
         info "作用: 防止容器借别人的 IP 发包（反射攻击、日志污染、绕过按 IP 的限制）"
         subline
@@ -2759,7 +2778,7 @@ doctor() {
             if [ -n "$b4c" ]; then
                 [ "$(sec_flag "$bc" "$ndev" ipv4_filtering 2>/dev/null)" = "true" ] || no4="$no4 $bc"
             fi
-            if [ -n "$b6c" ]; then
+            if [ -n "$b6c" ] && v6_filter_available; then
                 [ "$(sec_flag "$bc" "$ndev" ipv6_filtering 2>/dev/null)" = "true" ] || no6="$no6 $bc"
             fi
         done
@@ -2778,12 +2797,20 @@ doctor() {
         if [ -n "$no6" ]; then
             printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv6_filtering" "$no6"
         fi
+        if [ -n "$b6c" ] && ! v6_filter_available; then
+            printf '  %s[说明]%s %-26s %s\n' "$BLUE" "$NC" "IPv6 源地址过滤" \
+                "受 TPROXY 限制不可用（bridge-nf-call-ip6tables=0），IPv4 过滤不受影响"
+        fi
         if [ -n "$no4$no6" ]; then
             info "这些容器可以伪造源 IP 发包（反射攻击 / 日志污染）"
             info "网桥地址族：$fam ｜ 宿主机出网：$hostfam"
             info "处理：菜单 [17] → [2] 安全加固 可一键开启（按网桥实际族执行）"
         else
-            check_item "容器源 IP 防伪" 0 "所有运行中容器均已开启（网桥：$fam ｜ 宿主机出网：$hostfam）"
+            if [ -n "$b6c" ] && ! v6_filter_available; then
+                check_item "容器源 IP 防伪" 0 "IPv4 已开启（IPv6 受 TPROXY 限制不可用 ｜ 网桥：$fam）"
+            else
+                check_item "容器源 IP 防伪" 0 "所有运行中容器均已开启（网桥：$fam ｜ 宿主机出网：$hostfam）"
+            fi
         fi
     fi
     local _auth _live2 _ghost
