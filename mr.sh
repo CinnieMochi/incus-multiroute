@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.11
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.12
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.11"
+SCRIPT_VERSION="3.4.12"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -2023,9 +2023,10 @@ sec_apply_one() {  # $1=容器  $2=1 开启 / 0 关闭
     local c="$1" mode="$2" dev rc=0 k
     dev="$(container_nic_dev "$c")"
     for k in ipv4_filtering ipv6_filtering; do
+        # 判据是"网桥有没有这一族"：容器能发该族的包，就有伪造该族的风险
         case "$k" in
-            ipv4_filtering) host_has_ipv4 || continue ;;
-            ipv6_filtering) host_has_ipv6 || continue ;;
+            ipv4_filtering) [ -n "$(bridge_ipv4 2>/dev/null)" ] || continue ;;
+            ipv6_filtering) [ -n "$(bridge_ipv6 2>/dev/null)" ] || continue ;;
         esac
         if [ "$mode" = "1" ]; then
             incus config device set "$c" "$dev" "security.$k" true >/dev/null 2>&1 || rc=1
@@ -2250,7 +2251,11 @@ sec_menu() {
     local c dev a
     while true; do
         title "安全加固"
-        printf '  %s宿主协议族%s  IPv4: %s   IPv6: %s
+        printf '  %s网桥地址族%s  IPv4: %s   IPv6: %s
+' "$BLUE" "$NC" \
+            "$([ -n "$(bridge_ipv4 2>/dev/null)" ] && echo 有 || echo 无)" \
+            "$([ -n "$(bridge_ipv6 2>/dev/null)" ] && echo 有 || echo 无)"
+        printf '  %s宿主出网族%s  IPv4: %s   IPv6: %s
 ' "$BLUE" "$NC" \
             "$(host_has_ipv4 && echo 有 || echo 无)" "$(host_has_ipv6 && echo 有 || echo 无)"
         info "加固内容: 禁止容器伪造源 IP（security.ipv4_filtering / security.ipv6_filtering）"
@@ -2513,20 +2518,43 @@ doctor() {
             fi
         fi
     fi
-    if [ -f "$BIND_CONF" ] && has_cmd incus; then
-        local bc nofilter="" live
-        live="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"')"
-        while IFS='|' read -r bc _ _ _; do
-            case "$bc" in ''|'#'*) continue ;; esac
-            printf '%s\n' "$live" | grep -qxF "$bc" || continue
-            incus config show "$bc" 2>/dev/null | grep -q 'ipv4_filtering: "true"' || nofilter="$nofilter $bc"
-        done < "$BIND_CONF"
-        if [ -n "$nofilter" ]; then
-            printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv4_filtering" "$nofilter"
+    if has_cmd incus; then
+        local bc no4="" no6="" live fam desc b4c b6c
+        b4c="$(bridge_ipv4 2>/dev/null)"; b6c="$(bridge_ipv6 2>/dev/null)"
+        # 检查所有运行中的容器（不只绑定的）：加固是主机级安全措施
+        live="$(incus list --format=csv -c ns </dev/null 2>/dev/null | awk -F, '$2=="RUNNING"{print $1}')"
+        for bc in $live; do
+            [ -n "$bc" ] || continue
+            local cfg
+            cfg="$(incus config show "$bc" 2>/dev/null)"
+            if [ -n "$b4c" ]; then
+                printf '%s' "$cfg" | grep -q 'ipv4_filtering: "true"' || no4="$no4 $bc"
+            fi
+            if [ -n "$b6c" ]; then
+                printf '%s' "$cfg" | grep -q 'ipv6_filtering: "true"' || no6="$no6 $bc"
+            fi
+        done
+        # 按"网桥实际有哪几族"给出结论（单栈只查一族，双栈两族都查）
+        fam=""
+        [ -n "$b4c" ] && fam="IPv4"
+        if [ -n "$b6c" ]; then [ -n "$fam" ] && fam="$fam + IPv6" || fam="IPv6"; fi
+        [ -n "$fam" ] || fam="无"
+        local hostfam=""
+        [ "$g4" = "1" ] && hostfam="IPv4"
+        if [ "$g6" = "1" ]; then [ -n "$hostfam" ] && hostfam="$hostfam + IPv6" || hostfam="IPv6"; fi
+        [ -n "$hostfam" ] || hostfam="无"
+        if [ -n "$no4" ]; then
+            printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv4_filtering" "$no4"
+        fi
+        if [ -n "$no6" ]; then
+            printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "未开 ipv6_filtering" "$no6"
+        fi
+        if [ -n "$no4$no6" ]; then
             info "这些容器可以伪造源 IP 发包（反射攻击 / 日志污染）"
-            info "处理：菜单 [17] → [2] 安全加固 可一键开启（IPv4/IPv6 按宿主机实际情况）"
+            info "网桥地址族：$fam ｜ 宿主机出网：$hostfam"
+            info "处理：菜单 [17] → [2] 安全加固 可一键开启（按网桥实际族执行）"
         else
-            check_item "容器源 IP 防伪" 0 "已绑定容器均开启 ipv4_filtering"
+            check_item "容器源 IP 防伪" 0 "所有运行中容器均已开启（网桥：$fam ｜ 宿主机出网：$hostfam）"
         fi
     fi
     local _auth _live2 _ghost
