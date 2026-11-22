@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.15
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.16
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -50,7 +50,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.15"
+SCRIPT_VERSION="3.4.16"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -473,7 +473,7 @@ gen_nft() {
     elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
     # IPv6：只有网桥配了 IPv6 才启用整套 v6 规则
     BRIDGE6="$(bridge_ipv6 2>/dev/null)"
-    local has6=0 elems6="" bypass6="::1/128, fe80::/10, fc00::/7, ff00::/8" v6plan="" cgw6=""
+    local has6=0 elems6="" bypass6="::1/128, fe80::/10, fc00::/7, ff00::/8" v6plan="" cgw6="" hx4="" hx6=""
     V6_SCOPE="strict"; V6_BROAD=0; V6_MAPN=0
     if [ -n "$BRIDGE6" ]; then
         has6=1
@@ -484,6 +484,8 @@ gen_nft() {
             local _bp
             _bp="$(printf '%s' "$v6plan" | jq -r '.bypass // [] | join(", ")')"
             cgw6="$(printf '%s' "$v6plan" | jq -r '.src6 // [] | join(", ")')"
+            hx4="$(printf '%s' "$v6plan" | jq -r '.host4 // [] | join(" ")')"
+            hx6="$(printf '%s' "$v6plan" | jq -r '.host6 // [] | join(" ")')"
             [ -n "$_bp" ] && bypass6="$_bp"
             elems6="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | .[]' | awk '{printf "%s        %s", (n++ ? ",\n" : "\n"), $0}')"
             V6_MAPN="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | length')"
@@ -547,6 +549,13 @@ gen_nft() {
             if [ "${BLOCK_EGRESS_ALLOW_LAN:-1}" = "1" ]; then
                 [ -n "$_b4n" ] && _ex4="ip daddr != $_b4n "
                 [ -n "$_b6n" ] && _ex6="ip6 daddr != $_b6n "
+                local _h
+                for _h in $hx4; do
+                    if [ -n "$_h" ]; then _ex4="${_ex4}ip daddr != $_h "; fi
+                done
+                for _h in $hx6; do
+                    if [ -n "$_h" ]; then _ex6="${_ex6}ip6 daddr != $_h "; fi
+                done
             fi
             if [ -n "$_b4n" ]; then
                 echo "        ip saddr $_b4n ${_ex4}tcp dport $_setp counter drop"
@@ -601,12 +610,19 @@ v6_plan_json() {
     # 依据：已绑定容器的 v6 前缀（宿主 veth 路由 + incus 配置 + 运行时地址）
     has_cmd python3 || return 1
     [ -n "${BRIDGE6:-}" ] || BRIDGE6="$(bridge_ipv6 2>/dev/null)"
-    python3 - "$BIND_CONF" "${BRIDGE6:-}" "${V6_MATCH_ANY:-auto}" <<'PYCODE'
+    python3 - "$BIND_CONF" "${BRIDGE6:-}" "${V6_MATCH_ANY:-auto}" "$(bridge_v4_net 2>/dev/null)" <<'PYCODE'
 import json, subprocess, sys, ipaddress
 
 bind_conf = sys.argv[1]
 bridge6 = sys.argv[2]
 force = (sys.argv[3] if len(sys.argv) > 3 else 'auto').strip()
+bridge4 = (sys.argv[4] if len(sys.argv) > 4 else '').strip()
+bridge4_net = None
+if bridge4:
+    try:
+        bridge4_net = ipaddress.ip_network(bridge4, strict=False)
+    except Exception:
+        bridge4_net = None
 
 def run(cmd):
     try:
@@ -763,6 +779,23 @@ except Exception:
     pass
 bypass_out = [str(n) for n in sorted(_bnets, key=lambda x: (x.prefixlen, int(x.network_address)))]
 
+host4 = []
+for tok in run(['ip', '-4', '-o', 'addr', 'show', 'scope', 'global']).split():
+    if '/' in tok and ':' not in tok:
+        host4.append(tok.split('/')[0] + '/32')
+host6nets = []
+for tok in run(['ip', '-6', '-o', 'addr', 'show', 'scope', 'global']).split():
+    if '/' in tok and ':' in tok:
+        try:
+            host6nets.append(str(ipaddress.ip_interface(tok).network))
+        except Exception:
+            pass
+if bridge4_net is not None:
+    host4 = [h for h in host4 if ipaddress.ip_interface(h).ip not in bridge4_net]
+if bridge_net is not None:
+    host6nets = [n for n in host6nets if not ipaddress.ip_network(n, strict=False).subnet_of(bridge_net)]
+host4_out = sorted(set(host4))
+host6_out = sorted(set(host6nets))
 src6 = set()
 for _nm in instances:
     src6 |= prefixes_of(_nm)
@@ -782,7 +815,7 @@ print(json.dumps({'mode': 'wide' if wide else 'strict',
                   'ip6map': ip6map,
                   'bypass': bypass_out,
                   'src6': src6_out,
-                  'broad': hostprefix_broad, 'missing': missing}))
+                  'broad': hostprefix_broad, 'missing': missing, 'host4': host4_out, 'host6': host6_out}))
 PYCODE
 }
 addr_family() {  # $1=地址或域名 → 输出 v4/v6/unknown（域名按解析结果判断）
