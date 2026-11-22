@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.9
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.10
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.9"
+SCRIPT_VERSION="3.4.10"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -3245,7 +3245,9 @@ exits_print_numbered() {
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp mhost6 <<< "$l"
         [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
-        printf '  %s%2s%s  %-16s %-18s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$st"
+        local tn="单"
+        [ -n "${mhost6:-}" ] && tn="${GREEN}双${NC}"
+        printf '  %s%2s%s  %-16s %-18s %-24s %-6s %-8s %-4b %b\n' "$GREEN" "$idx" "$NC" "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$tn" "$st"
         printf '%s\n' "$name" >> "$1"
         idx=$((idx + 1))
     done < "$EXITS_CONF"
@@ -3268,7 +3270,7 @@ containers_print_numbered() {
 exits_show_table() {
     local f
     f="$(mktemp)"
-    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-24s %-6s %-8s %-4s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "隧道" "状态"
     subline
     exits_print_numbered "$f"
     rm -f "$f"
@@ -3279,7 +3281,7 @@ exit_del() {
     clear_if_tty
     title "删除出口节点"
     f="$(mktemp)"
-    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-24s %-6s %-8s %-4s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "隧道" "状态"
     subline
     exits_print_numbered "$f"
     subline
@@ -3331,7 +3333,7 @@ exits_list() {
         clear_if_tty
         title "出口节点（启用开关）"
         f="$(mktemp)"
-        printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+        printf '  %-3s %-16s %-18s %-24s %-6s %-8s %-4s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "隧道" "状态"
         subline
         exits_print_numbered "$f"
         subline
@@ -3402,7 +3404,7 @@ exit_test_menu() {
     clear_if_tty
     title "测试出口连通性"
     f="$(mktemp)"
-    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-24s %-6s %-8s %-4s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "隧道" "状态"
     subline
     exits_print_numbered "$f"
     subline
@@ -3489,7 +3491,7 @@ bind_menu_choose() {
 
     clear_if_tty
     ef="$(mktemp)"
-    printf '  %-3s %-16s %-18s %-20s %-6s %-8s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "状态"
+    printf '  %-3s %-16s %-18s %-24s %-6s %-8s %-4s %s\n' "编号" "名称" "协议" "地址" "端口" "mark" "隧道" "状态"
     subline
     exits_print_numbered "$ef"
     subline
