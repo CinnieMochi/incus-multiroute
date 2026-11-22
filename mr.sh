@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.12
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.13
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -40,12 +40,13 @@ AUTO_GRANT="${AUTO_GRANT:-0}"
 BRIDGE_IPV6_AUTO="${BRIDGE_IPV6_AUTO:-0}"
 BRIDGE_IPV4_AUTO="${BRIDGE_IPV4_AUTO:-0}"
 AUTO_HARDEN="${AUTO_HARDEN:-0}"
+V6_MATCH_ANY="${V6_MATCH_ANY:-auto}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.12"
+SCRIPT_VERSION="3.4.13"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -457,24 +458,38 @@ gen_nft() {
     elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
     # IPv6：只有网桥配了 IPv6 才启用整套 v6 规则
     BRIDGE6="$(bridge_ipv6 2>/dev/null)"
-    local has6=0 elems6=""
+    local has6=0 elems6="" bypass6="::1/128, fe80::/10, fc00::/7, ff00::/8" v6plan=""
+    V6_SCOPE="strict"; V6_BROAD=0; V6_MAPN=0
     if [ -n "$BRIDGE6" ]; then
         has6=1
-        local _bn _bip _bex _bmark _b6 _first6=1
-        while IFS='|' read -r _bn _bip _bex _bmark; do
-            case "$_bn" in ''|'#'*) continue ;; esac
-            [ -n "$_bmark" ] || continue
-            _b6="$(container_ip6 "$_bn" 2>/dev/null)"
-            [ -n "$_b6" ] || continue
-            if [ "$_first6" = "1" ]; then
-                elems6="
+        if v6plan="$(v6_plan_json 2>/dev/null)" && [ -n "$v6plan" ]; then
+            # 规划器：按容器实际前缀生成映射，并判定严格/宽匹配
+            [ "$(printf '%s' "$v6plan" | jq -r '.mode // "strict"')" = "wide" ] && V6_SCOPE="wide"
+            [ "$(printf '%s' "$v6plan" | jq -r '.broad // false')" = "true" ] && V6_BROAD=1
+            local _bp
+            _bp="$(printf '%s' "$v6plan" | jq -r '.bypass // [] | join(", ")')"
+            [ -n "$_bp" ] && bypass6="$_bp"
+            elems6="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | .[]' | awk '{printf "%s        %s", (n++ ? ",\n" : "\n"), $0}')"
+            V6_MAPN="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | length')"
+        else
+            # 回退（无 python3/jq）：沿用旧逻辑，只取一个地址
+            local _bn _bip _bex _bmark _b6 _first6=1
+            while IFS='|' read -r _bn _bip _bex _bmark; do
+                case "$_bn" in ''|'#'*) continue ;; esac
+                [ -n "$_bmark" ] || continue
+                _b6="$(container_ip6 "$_bn" 2>/dev/null)"
+                [ -n "$_b6" ] || continue
+                if [ "$_first6" = "1" ]; then
+                    elems6="
         $_b6 : $_bmark"
-                _first6=0
-            else
-                elems6="$elems6,
+                    _first6=0
+                else
+                    elems6="$elems6,
         $_b6 : $_bmark"
-            fi
-        done < "$BIND_CONF"
+                fi
+                V6_MAPN=$((V6_MAPN + 1))
+            done < "$BIND_CONF"
+        fi
     fi
     {
         echo "# 由 Incus MultiRoute 生成于 $ts —— 请勿手改"
@@ -487,20 +502,32 @@ gen_nft() {
         fi
         # ---- IPv6 部分（仅在网桥有 IPv6 时生成）----
         if [ "$has6" = "1" ]; then
-            printf '    set bypass6 {\n        type ipv6_addr\n        flags interval\n        elements = { ::1/128, fe80::/10, fc00::/7 }\n    }\n'
+            printf '    set bypass6 {\n        type ipv6_addr\n        flags interval\n        elements = { %s }\n    }\n' "$bypass6"
             if [ -n "$elems6" ]; then
-                printf '    map c_ip6 {\n        type ipv6_addr : mark\n        elements = {%s\n        }\n    }\n' "$elems6"
+                printf '    map c_ip6 {\n        type ipv6_addr : mark\n        flags interval\n        elements = {%s\n        }\n    }\n' "$elems6"
             else
-                printf '    map c_ip6 {\n        type ipv6_addr : mark\n    }\n'
+                printf '    map c_ip6 {\n        type ipv6_addr : mark\n        flags interval\n    }\n'
             fi
         fi
         # 透明代理：TCP + UDP 都走 tproxy（需要 br_netfilter=0）
         echo '    chain prerouting {'
         echo '        type filter hook prerouting priority mangle; policy accept;'
         echo "        iifname \"$BRIDGE\" ip daddr @bypass4 return"
-        [ "$has6" = "1" ] && echo "        iifname \"$BRIDGE\" ip6 daddr @bypass6 return"
+        if [ "$has6" = "1" ]; then
+            if [ "$V6_SCOPE" = "wide" ]; then
+                echo "        ip6 daddr @bypass6 return"
+            else
+                echo "        iifname \"$BRIDGE\" ip6 daddr @bypass6 return"
+            fi
+        fi
         echo "        iifname \"$BRIDGE\" meta mark set ip saddr map @c_ip"
-        [ "$has6" = "1" ] && echo "        iifname \"$BRIDGE\" meta mark set ip6 saddr map @c_ip6"
+        if [ "$has6" = "1" ]; then
+            if [ "$V6_SCOPE" = "wide" ]; then
+                echo "        meta mark set ip6 saddr map @c_ip6"
+            else
+                echo "        iifname \"$BRIDGE\" meta mark set ip6 saddr map @c_ip6"
+            fi
+        fi
         echo "        iifname \"$BRIDGE\" meta mark 0x0 return"
         # 注意：这里绝不能加 "socket transparent 1 accept"，它会把包直接放行走宿主
         exits_each emit_tproxy
@@ -521,6 +548,179 @@ gen_nft() {
 }
 
 
+v6_plan_json() {
+    # 输出 JSON：{"mode":"strict|wide","ip6map":[...],"bypass":[...]}
+    # 依据：已绑定容器的 v6 前缀（宿主 veth 路由 + incus 配置 + 运行时地址）
+    has_cmd python3 || return 1
+    [ -n "${BRIDGE6:-}" ] || BRIDGE6="$(bridge_ipv6 2>/dev/null)"
+    python3 - "$BIND_CONF" "${BRIDGE6:-}" "${V6_MATCH_ANY:-auto}" <<'PYCODE'
+import json, subprocess, sys, ipaddress
+
+bind_conf = sys.argv[1]
+bridge6 = sys.argv[2]
+force = (sys.argv[3] if len(sys.argv) > 3 else 'auto').strip()
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=10).stdout.decode('utf-8', 'ignore')
+    except Exception:
+        return ''
+
+bridge_net = None
+if bridge6:
+    try:
+        bridge_net = ipaddress.ip_network(bridge6 + '/64', strict=False)
+    except Exception:
+        bridge_net = None
+
+bound = []
+try:
+    with open(bind_conf, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('|')
+            if len(parts) >= 4 and parts[0] and parts[3]:
+                bound.append((parts[0], parts[3]))
+except OSError:
+    bound = []
+
+instances = {}
+try:
+    for c in json.loads(run(['incus', 'list', '--format=json']) or '[]'):
+        instances[c.get('name', '')] = c
+except Exception:
+    instances = {}
+
+def prefixes_of(name):
+    out = set()
+    st = run(['incus', 'query', '/1.0/instances/%s/state' % name])
+    veths = []
+    try:
+        j = json.loads(st or '{}')
+        for iface in (j.get('network') or {}).values():
+            if isinstance(iface, dict) and iface.get('host_name'):
+                veths.append(iface['host_name'])
+    except Exception:
+        pass
+    for v in veths:
+        for ln in run(['ip', '-6', 'route', 'show', 'dev', v]).splitlines():
+            toks = ln.split()
+            if toks and '/' in toks[0]:
+                out.add(toks[0])
+    for ln in run(['incus', 'config', 'show', name]).splitlines():
+        ln = ln.strip()
+        if ln.startswith('ipv6.address:'):
+            v = ln.split(':', 1)[1].strip().strip('"')
+            if '/' in v:
+                out.add(v)
+    c = instances.get(name)
+    # 只取可能真正从宿主出网的网卡：容器内的 wg/tun/docker 等隧道网卡不算
+    _skip = ('wg', 'tun', 'tap', 'ppp', 'docker', 'br-', 'lo')
+    if c:
+        for ifname, it in ((c.get('state') or {}).get('network') or {}).items():
+            if not isinstance(it, dict):
+                continue
+            if str(ifname).startswith(_skip):
+                continue
+            for a in it.get('addresses') or []:
+                if isinstance(a, dict) and a.get('family') == 'inet6' and a.get('scope') != 'link':
+                    out.add(a.get('address', '') + '/128')
+    res = set()
+    for p in out:
+        try:
+            n = ipaddress.ip_network(p, strict=False)
+        except Exception:
+            continue
+        if n.version != 6 or n.is_link_local or n.is_loopback or n.is_multicast:
+            continue
+        res.add(n)
+    return res
+
+per = []
+for name, mark in bound:
+    for n in sorted(prefixes_of(name), key=lambda x: (x.prefixlen, int(x.network_address))):
+        per.append((name, mark, n))
+
+wide = False
+if force == '1':
+    wide = True
+elif force == '0':
+    wide = False
+else:
+    for _n, _m, net in per:
+        if bridge_net is None or not net.subnet_of(bridge_net):
+            wide = True
+            break
+
+# 同一 mark 下的前缀合并（nft interval 集合不允许重叠）
+_by_mark = {}
+for _n, mark, net in per:
+    _by_mark.setdefault(mark, []).append(net)
+ip6map = []
+for _mark, _nets in _by_mark.items():
+    try:
+        _merged = list(ipaddress.collapse_addresses(_nets))
+    except Exception:
+        _merged = _nets
+    for _net in sorted(_merged, key=lambda x: (x.prefixlen, int(x.network_address))):
+        ip6map.append('%s : %s' % (str(_net), _mark))
+missing = []
+for name, _mk in bound:
+    if any(nm == name for nm, _m2, _net in per):
+        continue
+    c = instances.get(name)
+    if not c:
+        continue
+    has_v6 = False
+    for _ifn, it in ((c.get('state') or {}).get('network') or {}).items():
+        if not isinstance(it, dict) or str(_ifn).startswith(('wg', 'tun', 'tap', 'ppp', 'docker', 'br-', 'lo')):
+            continue
+        for a in it.get('addresses') or []:
+            if isinstance(a, dict) and a.get('family') == 'inet6' and a.get('scope') != 'link':
+                has_v6 = True
+    if has_v6:
+        missing.append(name)
+
+bypass = ['::1/128', 'fe80::/10', 'fc00::/7', 'ff00::/8']
+hostprefix_broad = False
+for tok in run(['ip', '-6', '-o', 'addr', 'show', 'scope', 'global']).split():
+    if '/' not in tok or ':' not in tok:
+        continue
+    try:
+        n = ipaddress.ip_interface(tok).network
+    except Exception:
+        continue
+    if n.version != 6:
+        continue
+    if n.prefixlen < 48:
+        hostprefix_broad = True
+        bypass.append('%s/128' % tok.split('/')[0])
+    else:
+        bypass.append(str(n))
+if hostprefix_broad:
+    for _n, _m, net in per:
+        bypass.append(str(net))
+
+_bnets = []
+for b in bypass:
+    try:
+        _bnets.append(ipaddress.ip_network(b, strict=False))
+    except Exception:
+        pass
+try:
+    _bnets = list(ipaddress.collapse_addresses(_bnets))
+except Exception:
+    pass
+bypass_out = [str(n) for n in sorted(_bnets, key=lambda x: (x.prefixlen, int(x.network_address)))]
+
+print(json.dumps({'mode': 'wide' if wide else 'strict',
+                  'ip6map': ip6map,
+                  'bypass': bypass_out,
+                  'broad': hostprefix_broad, 'missing': missing}))
+PYCODE
+}
 addr_family() {  # $1=地址或域名 → 输出 v4/v6/unknown（域名按解析结果判断）
     local a="$1"
     case "$a" in
@@ -768,9 +968,10 @@ emit_tproxy6() {
     [ -n "${BRIDGE6:-}" ] || return 0
     case "$proto" in
         ss|ss2022|logic)
-            local port
+            local port scope=""
             port="$(exit_ss_port "$name")"
-            echo "        iifname \"$BRIDGE\" meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip6 to [$BRIDGE6]:$port meta mark set 0x80000001"
+            [ "${V6_SCOPE:-strict}" = "strict" ] && scope="iifname \"$BRIDGE\" "
+            echo "        ${scope}meta mark $mark meta l4proto { tcp, udp } ct direction original tproxy ip6 to [$BRIDGE6]:$port meta mark set 0x80000001"
             ;;
     esac
 }
@@ -2007,12 +2208,16 @@ host_has_ipv6() { ip -6 route show default 2>/dev/null | grep -q default; }
 
 # 找出容器的网卡设备名（通常 eth0，但不写死）
 container_nic_dev() {
-    local c="$1" dev
-    dev="$(incus config device show "$c" 2>/dev/null | awk '
-        /^[A-Za-z0-9_.-]+:$/ { name=$0; sub(/:$/, "", name) }
-        /nictype:|network:/ { if (name != "") { print name; exit } }
-    ')"
-    printf '%s' "${dev:-eth0}"
+    # 优先返回桥接网卡：security.* 加固选项只对桥接网卡有效
+    local c="$1" d first="" br=""
+    for d in $(incus config device list "$c" 2>/dev/null); do
+        [ "$(incus config device get "$c" "$d" type 2>/dev/null)" = "nic" ] || continue
+        [ -n "$first" ] || first="$d"
+        if [ "$(incus config device get "$c" "$d" nictype 2>/dev/null)" = "bridged" ] || [ -n "$(incus config device get "$c" "$d" network 2>/dev/null)" ]; then
+            br="$d"; break
+        fi
+    done
+    printf '%s' "${br:-${first:-eth0}}"
 }
 
 sec_flag() {  # $1=容器 $2=设备 $3=ipv4_filtering|ipv6_filtering  → 输出 true/空
@@ -2500,6 +2705,30 @@ doctor() {
             info "某一侧的地址族解析不出来时，该族目标会连不上；可用 [3] → [8] 修正"
         fi
     fi
+    # IPv6 代理模式与地址映射（与 nft 生成同一套规划器）
+    if [ -n "$(bridge_ipv6 2>/dev/null)" ] && has_cmd python3 && has_cmd jq; then
+        local _vp _vmode _vmapn _vbroad _vmiss
+        _vp="$(v6_plan_json 2>/dev/null)"
+        if [ -n "$_vp" ]; then
+            _vmode="$(printf '%s' "$_vp" | jq -r '.mode // "strict"')"
+            _vmapn="$(printf '%s' "$_vp" | jq -r '.ip6map // [] | length')"
+            _vbroad="$(printf '%s' "$_vp" | jq -r '.broad // false')"
+            _vmiss="$(printf '%s' "$_vp" | jq -r '.missing // [] | join(" ")')"
+            if [ "$_vmode" = "wide" ]; then
+                check_item "IPv6 代理模式" 0 "宽匹配（检测到绑定容器使用网桥外的公网 IPv6）"
+            else
+                check_item "IPv6 代理模式" 0 "严格（绑定容器 IPv6 均在网桥网段内）"
+            fi
+            if [ -n "$_vmiss" ]; then
+                printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "IPv6 地址映射" "$_vmiss（有 IPv6 但未纳入映射）"
+            else
+                check_item "IPv6 地址映射" 0 "已绑定容器共 $_vmapn 条前缀"
+            fi
+            if [ "$_vbroad" = "true" ]; then
+                printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "IPv6 绕过前缀" "宿主前缀过宽（短于 /48），已按容器前缀精确绕过"
+            fi
+        fi
+    fi
     # 绑定 IP 是否落在网桥网段（容器多网卡时容易绑错，导致代理不生效 + API 认不出身份）
     if [ -f "$BIND_CONF" ]; then
         local _bn _bip _bex _bmk _cidr _badip=""
@@ -2525,13 +2754,13 @@ doctor() {
         live="$(incus list --format=csv -c ns </dev/null 2>/dev/null | awk -F, '$2=="RUNNING"{print $1}')"
         for bc in $live; do
             [ -n "$bc" ] || continue
-            local cfg
-            cfg="$(incus config show "$bc" 2>/dev/null)"
+            local ndev
+            ndev="$(container_nic_dev "$bc" 2>/dev/null)"; ndev="${ndev:-eth0}"
             if [ -n "$b4c" ]; then
-                printf '%s' "$cfg" | grep -q 'ipv4_filtering: "true"' || no4="$no4 $bc"
+                [ "$(sec_flag "$bc" "$ndev" ipv4_filtering 2>/dev/null)" = "true" ] || no4="$no4 $bc"
             fi
             if [ -n "$b6c" ]; then
-                printf '%s' "$cfg" | grep -q 'ipv6_filtering: "true"' || no6="$no6 $bc"
+                [ "$(sec_flag "$bc" "$ndev" ipv6_filtering 2>/dev/null)" = "true" ] || no6="$no6 $bc"
             fi
         done
         # 按"网桥实际有哪几族"给出结论（单栈只查一族，双栈两族都查）
