@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.7
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.8
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.7"
+SCRIPT_VERSION="3.4.8"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -670,8 +670,11 @@ exit_add_logic() {
                     [ "$pass" = "0" ] && { st="port"; continue; }
                     [ -n "$pass" ] || { err "密码不能为空"; continue; }
                     if [ "$step" = "ss2022" ]; then
-                        if ! reason="$(ss2022_pass_check "$method" "$pass")"; then
-                            err "密码不符合 $method 的格式：$reason"
+                        if np="$(ss2022_pass_check "$method" "$pass")"; then
+                            [ "$np" != "$pass" ] && info "已自动补齐 base64 填充：$np"
+                            pass="$np"
+                        else
+                            err "密码不符合 $method 的格式：$np"
                             info "单密钥：16/32 字节的 base64；双密钥：两段 base64 用 : 连接"
                             continue
                         fi
@@ -816,45 +819,74 @@ ensure_wg_key() {
     printf ' %s宿主机公钥%s（填进出口机 wg 配置的 [Peer] PublicKey）:\n  %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$pub" "$NC"
 }
 
+b64_pad() {
+    # 给 base64 补齐 "=" 填充（用户复制时常漏掉），返回补齐后的串
+    local s="$1" m
+    [ -n "$s" ] || return 1
+    case "$s" in *[!A-Za-z0-9+/=]*) return 1 ;; esac
+    case "$s" in
+        *=*)
+            # 已经带填充：长度必须是 4 的倍数，否则非法（不能再补 "="）
+            [ $(( ${#s} % 4 )) -eq 0 ] && printf '%s' "$s" || return 1
+            return 0
+            ;;
+    esac
+    m=$(( ${#s} % 4 ))
+    case "$m" in
+        0) printf '%s' "$s" ;;
+        2) printf '%s==' "$s" ;;
+        3) printf '%s=' "$s" ;;
+        *) return 1 ;;
+    esac
+}
+
 b64_bytes() {
-    # base64 解码后的字节数；非法 base64 返回 0
-    local s="$1" n
+    # base64 解码后的字节数；解码失败（含填充不全）返回 0
+    local s="$1" n rc
     [ -n "$s" ] || { echo 0; return; }
     case "$s" in *[!A-Za-z0-9+/=]*) echo 0; return ;; esac
+    s="$(b64_pad "$s")" || { echo 0; return; }
     if has_cmd base64; then
         n="$(printf '%s' "$s" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+        rc=${PIPESTATUS[1]:-0}
+        # 注意：base64 -d 失败时也可能吐出半截字节，必须用退出码判断
+        if ! printf '%s' "$s" | base64 -d >/dev/null 2>&1; then
+            echo 0; return
+        fi
         echo "${n:-0}"
     else
-        # 没有 base64 工具时按长度估算：24/22 字符=16 字节，44/43 字符=32 字节
         case "${#s}" in
-            24|22) echo 16 ;;
-            44|43) echo 32 ;;
+            24) echo 16 ;;
+            44) echo 32 ;;
             *) echo 0 ;;
         esac
     fi
 }
 
-ss2022_pass_check() {  # $1=method $2=password → 成功时输出 ok，失败时输出原因并返回 1
-    # 支持两种形式：
-    #   单密钥   base64(16B 或 32B)
-    #   双密钥   base64(16B或32B):base64(16B或32B)   ← 服务端多用户/中转场景
-    local method="$1" pass="$2" want k1 k2 b1 b2
+ss2022_pass_check() {  # $1=method $2=password
+    # 成功：stdout 输出**补齐填充后的密码**（可直接入库），返回 0
+    # 失败：stdout 输出原因，返回 1
+    # 支持：单密钥 base64 / 双密钥 base64:base64（两侧都按算法长度校验）
+    local method="$1" pass="$2" want k1 k2 p1 p2 b1 b2
     case "$method" in
         2022-blake3-aes-128-gcm|2022-blake3-chacha20-poly1305) want=16 ;;
         2022-blake3-aes-256-gcm) want=32 ;;
-        *) echo ok; return 0 ;;
+        *) printf '%s' "$pass"; return 0 ;;
     esac
     case "$pass" in
         *:*)
             k1="${pass%%:*}"; k2="${pass#*:}"
-            b1="$(b64_bytes "$k1")"; b2="$(b64_bytes "$k2")"
-            if [ "$b1" = "$want" ] && [ "$b2" = "$want" ]; then echo ok; return 0; fi
-            echo "双密钥格式要求冒号两侧各 ${want} 字节 base64（当前 ${b1}/${b2} 字节）"
+            p1="$(b64_pad "$k1")" || { echo "双密钥左侧不是合法 base64"; return 1; }
+            p2="$(b64_pad "$k2")" || { echo "双密钥右侧不是合法 base64"; return 1; }
+            b1="$(b64_bytes "$p1")"; b2="$(b64_bytes "$p2")"
+            if [ "$b1" = "$want" ] && [ "$b2" = "$want" ]; then printf '%s:%s' "$p1" "$p2"; return 0; fi
+            echo "双密钥要求冒号两侧各 ${want} 字节 base64（当前 ${b1}/${b2} 字节）"
             return 1
             ;;
         *)
-            b1="$(b64_bytes "$pass")"
-            if [ "$b1" = "$want" ]; then echo ok; return 0; fi
+            p1="$(b64_pad "$pass")" || { echo "不是合法的 base64 密钥"; return 1; }
+            b1="$(b64_bytes "$p1")"
+            if [ "$b1" = "$want" ]; then printf '%s' "$p1"; return 0; fi
             echo "该算法要求 ${want} 字节 base64 密钥（当前 ${b1} 字节）"
             return 1
             ;;
@@ -1080,6 +1112,8 @@ EOF
         if ! grep -q "|$n|" "$EXITS_CONF" 2>/dev/null; then
             systemctl disable --now "mr-ss-$n.service" >/dev/null 2>&1 || true
             rm -f "$f"
+            # 同时删掉该出口遗留的 sing-box 配置，避免残留 mark 对应的 JSON 堆着
+            rm -f "$SS_DIR/$n.json"
             info "已清理失效单元: mr-ss-$n.service"
         fi
     done
@@ -2384,6 +2418,27 @@ doctor() {
     else
         check_item "mark 段无冲突" 0 "0x1000-0x1fff 归本脚本专用"
     fi
+    # 出口密码格式（历史上曾因缺 "=" 填充导致 sing-box 启动失败）
+    if [ -f "$EXITS_CONF" ]; then
+        local _pn _pp _pm _pr _badpw=""
+        while IFS='|' read -r _pn _pp _pm _pr; do
+            case "$_pn" in ''|'#'*) continue ;; esac
+            [ "$_pp" = "ss2022" ] || continue
+            [ -n "$_pr" ] || continue
+            if ! _norm="$(ss2022_pass_check "$_pm" "$_pr")"; then
+                _badpw="$_badpw $_pn(格式非法)"
+            elif [ "$_norm" != "$_pr" ]; then
+                _badpw="$_badpw $_pn(缺=填充)"
+            fi
+        done < "$EXITS_CONF"
+        if [ -n "$_badpw" ]; then
+            printf '  %s[FAIL]%s %-26s %s\n' "$RED" "$NC" "出口密码格式" "$_badpw"
+            info "这些出口的 base64 密钥不完整（常见是漏了 = 填充），sing-box 会起不来"
+            info "处理：菜单 [3] 修改出口 → [5] 密码，重新输入会自动补齐"
+        else
+            check_item "出口密码格式" 0 "全部符合所选算法"
+        fi
+    fi
     # 绑定 IP 是否落在网桥网段（容器多网卡时容易绑错，导致代理不生效 + API 认不出身份）
     if [ -f "$BIND_CONF" ]; then
         local _bn _bip _bex _bmk _cidr _badip=""
@@ -2588,8 +2643,11 @@ exit_edit() {
                     printf '新密码（0 返回）: '; read -r val || return 0
                     case "$val" in 0|"") break ;; esac
                     if [ "$proto" = "ss2022" ]; then
-                        if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
-                            err "密码不符合 $method 的格式：$reason"; continue
+                        if np="$(ss2022_pass_check "$method" "$val")"; then
+                            [ "$np" != "$val" ] && info "已自动补齐 base64 填充"
+                            val="$np"
+                        else
+                            err "密码不符合 $method 的格式：$np"; continue
                         fi
                     fi
                     edit_exit_field "$name" 6 "$val" && edit_apply_changes
@@ -2729,8 +2787,11 @@ exit_edit_members() {  # $1=节点名
                    printf '新密码（0 返回）: '; read -r val || return 0
                    case "$val" in 0|"") break ;; esac
                    if [ "$proto" = "ss2022" ]; then
-                       if reason="$(ss2022_pass_check "$method" "$val")"; then :; else
-                           err "密码不符合 $method 的格式：$reason"; continue
+                       if np="$(ss2022_pass_check "$method" "$val")"; then
+                           [ "$np" != "$val" ] && info "已自动补齐 base64 填充"
+                           val="$np"
+                       else
+                           err "密码不符合 $method 的格式：$np"; continue
                        fi
                    fi
                    edit_logic_member_field "$node" "$midx" 7 "$val"; break
@@ -2848,8 +2909,11 @@ exit_add_extend() {
             printf '密码（输入 0 返回上一步）: '; read -r pass || return 0
             case "$pass" in 0|"") break ;; esac
             if [ "$proto" = "ss2022" ]; then
-                if reason="$(ss2022_pass_check "$method" "$pass")"; then break; fi
-                err "密码不符合 $method 的格式：$reason"
+                if np="$(ss2022_pass_check "$method" "$pass")"; then
+                    [ "$np" != "$pass" ] && info "已自动补齐 base64 填充"
+                    pass="$np"; break
+                fi
+                err "密码不符合 $method 的格式：$np"
                 continue
             fi
             break
@@ -2953,8 +3017,11 @@ exit_add() {
             printf '密码（输入 0 返回上一步）: '; read -r pass || return 0
             case "$pass" in 0|"") info "已返回端口输入"; step="port"; continue ;; esac
             if [ "$proto" = "ss2022" ]; then
-                if reason="$(ss2022_pass_check "$method" "$pass")"; then :; else
-                    err "密码不符合 $method 的格式：$reason"
+                if np="$(ss2022_pass_check "$method" "$pass")"; then
+                    [ "$np" != "$pass" ] && info "已自动补齐 base64 填充：$np"
+                    pass="$np"
+                else
+                    err "密码不符合 $method 的格式：$np"
                     info "单密钥示例: $(printf '%*s' 16 '' | tr ' ' 'A' | base64 -w0)"
                     info "双密钥示例: 两段各自 base64 后用 : 连接"
                     continue
