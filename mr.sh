@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.16
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.18
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -50,7 +50,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.16"
+SCRIPT_VERSION="3.4.18"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -423,9 +423,10 @@ bind_remove() {
 }
 
 clients_prune() {  # 删掉"容器已不存在"的授权/令牌/绑定记录
-    local live f name n=0 line
-    live="$(incus list --format=csv -c n </dev/null 2>/dev/null | tr -d '"' | sed '/^$/d')"
-    [ -n "$live" ] || return 0
+    local live f name n=0 line raw
+    raw="$(incus list --format=csv -c n </dev/null 2>/dev/null)" || { warn "无法读取容器列表，跳过清理"; return 1; }
+    live="$(printf '%s\n' "$raw" | tr -d '"' | sed '/^$/d')"
+    # 注意：容器数为 0 时也要清理（所有授权都成了失效记录）
     for f in "$CLIENT_ALLOW_CONF" "$TOKEN_CONF" "$BIND_CONF" "$CLIENT_DENY_CONF"; do
         [ -f "$f" ] || continue
         : > "$f.tmp"
@@ -3710,9 +3711,10 @@ exit_set_enable() {
 }
 
 exits_print_numbered() {
-    # $1 = 把名称按顺序写入的文件
+    # $1（可选）= 把名称按顺序写入的文件；不传就只打印
+    local outfile="${1:-}"
     local idx=1 l name proto host port meth pass mark wgkey wgif local expect enable lp st
-    : > "$1"
+    [ -n "$outfile" ] && : > "$outfile"
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
         IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp mhost6 <<< "$l"
@@ -3720,7 +3722,7 @@ exits_print_numbered() {
         local tn="单"
         [ -n "${mhost6:-}" ] && tn="${GREEN}双${NC}"
         printf '  %s%2s%s  %-16s %-18s %-24s %-6s %-8s %-4b %b\n' "$GREEN" "$idx" "$NC" "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$tn" "$st"
-        printf '%s\n' "$name" >> "$1"
+        [ -n "$outfile" ] && printf '%s\n' "$name" >> "$outfile"
         idx=$((idx + 1))
     done < "$EXITS_CONF"
 }
