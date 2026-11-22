@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.10
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.11
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.10"
+SCRIPT_VERSION="3.4.11"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -2622,7 +2622,8 @@ exit_edit() {
         printf '  %-14s %s\n' "加密方式" "${method:-（不适用）}"
         printf '  %-14s %s\n' "密码" "$([ -n "$pass" ] && echo '已设置（不显示）' || echo '未设置')"
         printf '  %-14s %s\n' "期望出口 IP" "${expect:-—}"
-        printf '  %-14s %s\n' "第二地址" "${host6:-（单隧道）}"
+        printf '  %-14s %s\n' "隧道模式" "$([ -n "${host6:-}" ] && echo "双隧道分流" || echo "单隧道")"
+        [ -n "${host6:-}" ] && printf '  %-14s %s\n' "第二地址" "$host6"
         printf '  %-14s %s\n' "指定本地端口" "${lp:-自动}"
         printf '  %-14s %s\n' "状态" "$([ "$enable" = "0" ] && echo 停用 || echo 启用)"
         subline
@@ -3049,6 +3050,25 @@ exit_add() {
                         err "还没有安装 wireguard-tools"
                         info "请先到菜单 [15] → [2] 安装"; pause_back; return 1; } ;;
             esac
+            # 先问隧道模式（决定了后面要填几个地址）
+            if { [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ]; } && \
+               ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
+                step="mode"
+            else
+                host6=""; step="name"
+            fi
+            ;;
+        mode)
+            printf '\n隧道模式（宿主机双栈）：\n'
+            printf '  %s[1]%s 单隧道（默认）：所有目标共用一条隧道，只填一个地址\n' "$GREEN" "$NC"
+            printf '  %s[2]%s 双隧道分流：IPv4 目标走 v4 隧道、IPv6 目标走 v6 隧道（填两个地址）\n' "$GREEN" "$NC"
+            printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
+            printf '请输入 [0-2]（回车=1）: '; read -r tsel || return 0
+            case "$tsel" in
+                0) info "已返回协议选择"; step="proto"; continue ;;
+                2) tunnel="2" ;;
+                *) tunnel="1" ;;
+            esac
             step="name"
             ;;
         name)
@@ -3058,13 +3078,36 @@ exit_add() {
             step="host"
             ;;
         host)
-            printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回上一步）: '; read -r host || return 0
-            case "$host" in 0|"") info "已返回名称输入"; step="name"; continue ;; esac
-            case "$host" in \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;; esac
-            case "$host" in
-                *:*) warn "这是 IPv6 地址：宿主机必须已有可用的 IPv6 出网，否则连不上" ;;
+            if [ "${tunnel:-}" = "2" ]; then
+                printf 'IPv4 隧道地址（IPv4 字面量 或 有 A 记录的域名，输入 0 返回上一步）: '; read -r host || return 0
+                case "$host" in 0|"") info "已返回名称输入"; step="name"; continue ;; esac
+                case "$(addr_family "$host")" in
+                    v4|both) ;;
+                    *) err "这不是 IPv4 地址，也没有 A 记录：$host"; continue ;;
+                esac
+                step="host6"
+            else
+                printf '服务器地址（IPv4 / IPv6 / 域名，输入 0 返回上一步）: '; read -r host || return 0
+                case "$host" in 0|"") info "已返回名称输入"; step="name"; continue ;; esac
+                case "$host" in \[*\]) host="$(printf '%s' "$host" | tr -d '[]')" ;; esac
+                case "$host" in
+                    *:*) warn "这是 IPv6 地址：宿主机必须已有可用的 IPv6 出网，否则连不上" ;;
+                esac
+                host6=""
+                if [ "$proto" = "wg" ]; then step="wgport"; else step="method"; fi
+            fi
+            ;;
+        host6)
+            printf 'IPv6 隧道地址（IPv6 字面量 或 有 AAAA 记录的域名，输入 0 返回上一步）: '; read -r host6 || return 0
+            case "$host6" in
+                0|"") info "已返回 IPv4 地址"; step="host"; continue ;;
             esac
-            if [ "$proto" = "wg" ]; then step="wgport"; else step="method"; fi
+            case "$host6" in \[*\]) host6="$(printf '%s' "$host6" | tr -d '[]')" ;; esac
+            case "$(addr_family "$host6")" in
+                v6|both) ;;
+                *) err "这不是 IPv6 地址，也没有 AAAA 记录：$host6"; continue ;;
+            esac
+            step="method"
             ;;
         method)
             if [ "$proto" = "ss2022" ]; then
@@ -3109,45 +3152,6 @@ exit_add() {
             else
                 reason="$(ss_classic_pass_check "$pass")" || { err "$reason"; continue; }
             fi
-            # 双栈宿主：可选双隧道分流（v4/v6 各走自己的隧道）
-            if { [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ]; } && \
-               ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
-                step="tunnel"
-            else
-                step="expect"
-            fi
-            ;;
-        tunnel)
-            printf '\n隧道模式（宿主机双栈）：\n'
-            printf '  %s[1]%s 单隧道（默认）：所有目标共用一条隧道\n' "$GREEN" "$NC"
-            printf '  %s[2]%s 双隧道分流：IPv4 目标走 v4 隧道、IPv6 目标走 v6 隧道\n' "$GREEN" "$NC"
-            printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
-            printf '请输入 [0-2]（回车=1）: '; read -r tsel || return 0
-            case "$tsel" in
-                0) info "已返回密码输入"; step="password"; continue ;;
-                2) ;;
-                *) host6=""; step="expect"; continue ;;
-            esac
-            # 判断已填地址属于哪一族，补齐另一族
-            local fam; fam="$(addr_family "$host")"
-            if [ "$fam" = "v6" ]; then
-                printf 'IPv4 隧道地址（IPv4 或 有 A 记录的域名，0 返回上一步）: '; read -r v4addr || return 0
-                case "$v4addr" in 0|"") info "已返回模式选择"; step="tunnel"; continue ;; esac
-                case "$(addr_family "$v4addr")" in
-                    v4|both) ;;
-                    *) err "这不是 IPv4 地址，也没有 A 记录：$v4addr"; continue ;;
-                esac
-                host6="$host"; host="$v4addr"
-            else
-                printf 'IPv6 隧道地址（IPv6 或 有 AAAA 记录的域名，0 返回上一步）: '; read -r v6addr || return 0
-                case "$v6addr" in 0|"") info "已返回模式选择"; step="tunnel"; continue ;; esac
-                case "$(addr_family "$v6addr")" in
-                    v6|both) ;;
-                    *) err "这不是 IPv6 地址，也没有 AAAA 记录：$v6addr"; continue ;;
-                esac
-                host6="$v6addr"
-            fi
-            ok "已启用双隧道：v4 → $host ；v6 → $host6"
             step="expect"
             ;;
         wgport)
@@ -3178,9 +3182,7 @@ exit_add() {
             printf '期望出口 IP（留空=服务器地址，输入 0 返回上一步）: '; read -r expect || return 0
             case "$expect" in 0)
                 info "已返回上一步"
-                if [ "$proto" = "wg" ]; then step="wglocal"
-                elif ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then step="tunnel"
-                else step="password"; fi
+                if [ "$proto" = "wg" ]; then step="wglocal"; else step="password"; fi
                 continue ;;
             esac
             [ -n "$expect" ] || expect="$host"
@@ -3309,6 +3311,10 @@ exit_del() {
     name="$(sed -n "${n}p" "$f")"
     rm -f "$f"
     [ -n "$name" ] || { err "无效编号"; pause_back; return 1; }
+    # 二次确认（编号会随列表变化，避免误删别的出口）
+    printf ' 确认删除出口「%s%s%s」? [y/N]: ' "$YELLOW" "$name" "$NC"
+    read -r a || return 0
+    case "$a" in [yY]) ;; *) info "已取消，未做任何改动"; pause_back; return 0 ;; esac
     grep -v "^$name|" "$EXITS_CONF" > "$EXITS_CONF.tmp"
     mv -f "$EXITS_CONF.tmp" "$EXITS_CONF"
     awk -F'|' -v n="$name" '$3!=n' "$BIND_CONF" > "$BIND_CONF.tmp" 2>/dev/null || :
