@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.8
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.9
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -45,7 +45,7 @@ UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.8"
+SCRIPT_VERSION="3.4.9"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -116,7 +116,7 @@ detect_subnet() {
 
 ensure_dirs() {
     mkdir -p "$CONF_DIR" "$DATA_DIR" "$DATA_DIR/client" "$SS_DIR"
-    [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
+    [ -f "$EXITS_CONF" ] || printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口|第二地址(双隧道)' > "$EXITS_CONF"
     [ -f "$BIND_CONF" ]  || printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
     [ -f "$TOKEN_CONF" ] || { : > "$TOKEN_CONF"; chmod 600 "$TOKEN_CONF"; }
     [ -f "$LOGIC_CONF" ] || printf '%s\n' '# 节点|序号|协议|地址|端口|加密|密码|家族(v4/v6)' > "$LOGIC_CONF"
@@ -190,8 +190,8 @@ exits_each() {
     local cb="$1" l
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS="|" read -r e_name e_proto e_host e_port e_method e_pass e_mark e_wgkey e_wgif e_local e_expect e_enable e_lp <<< "$l"
-        "$cb" "$e_name" "$e_proto" "$e_host" "$e_port" "$e_method" "$e_pass" "$e_mark" "$e_wgkey" "$e_wgif" "$e_local" "$e_expect" "$e_enable" "$e_lp"
+        IFS="|" read -r e_name e_proto e_host e_port e_method e_pass e_mark e_wgkey e_wgif e_local e_expect e_enable e_lp e_host6 <<< "$l"
+        "$cb" "$e_name" "$e_proto" "$e_host" "$e_port" "$e_method" "$e_pass" "$e_mark" "$e_wgkey" "$e_wgif" "$e_local" "$e_expect" "$e_enable" "$e_lp" "$e_host6"
     done < "$EXITS_CONF"
 }
 
@@ -220,7 +220,7 @@ exit_ss_port() {
     local want="$1" l i=0 name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
+        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 a11 <<< "$l"
         case "$proto" in ss|ss2022|logic) ;; *) continue ;; esac
         i=$((i + 1))
         if [ "$name" = "$want" ]; then
@@ -521,6 +521,40 @@ gen_nft() {
 }
 
 
+addr_family() {  # $1=地址或域名 → 输出 v4/v6/unknown（域名按解析结果判断）
+    local a="$1"
+    case "$a" in
+        *:*) printf 'v6'; return 0 ;;
+        *[0-9].[0-9]*) case "$a" in *[!0-9.]*) : ;; *) printf 'v4'; return 0 ;; esac ;;
+    esac
+    # 域名：看能解析出哪一族（优先返回单一族，双栈返回 both）
+    local has4=0 has6=0
+    getent ahostsv4 "$a" >/dev/null 2>&1 && has4=1
+    getent ahostsv6 "$a" >/dev/null 2>&1 && has6=1
+    if [ "$has4" = "1" ] && [ "$has6" = "1" ]; then printf 'both'
+    elif [ "$has4" = "1" ]; then printf 'v4'
+    elif [ "$has6" = "1" ]; then printf 'v6'
+    else printf 'unknown'; fi
+}
+
+split_cfg_json() {  # $1=本地端口 $2=v4侧地址 $3=v6侧地址 $4=端口 $5=method $6=password
+    local lport="$1" h4="$2" h6="$3" port="$4" method="$5" pass="$6"
+    local inb v6in b6
+    inb="$(printf '{"type":"tproxy","tag":"tproxy-in","listen":"%s","listen_port":%s,"network":["tcp","udp"]}' \
+        "$(json_esc "${SUBNET_GW:-0.0.0.0}")" "$lport")"
+    v6in=""
+    b6="$(bridge_ipv6 2>/dev/null)"
+    [ -n "$b6" ] && v6in=",$(printf '{"type":"tproxy","tag":"tproxy-in6","listen":"%s","listen_port":%s,"network":["tcp","udp"]}' "$(json_esc "$b6")" "$lport")"
+    printf '{\n  "log": { "level": "warn" },\n'
+    printf '  "dns": { "servers": [{"tag":"res-v4","type":"udp","server":"1.1.1.1","domain_strategy":"ipv4_only"},{"tag":"res-v6","type":"udp","server":"2606:4700:4700::1111","domain_strategy":"ipv6_only"}] },\n'
+    printf '  "inbounds": [%s%s],\n' "$inb" "$v6in"
+    printf '  "outbounds": [\n'
+    printf '    {"type":"shadowsocks","tag":"v4","server":"%s","server_port":%s,"method":"%s","password":"%s","domain_resolver":"res-v4"},\n' \
+        "$(json_esc "$h4")" "$port" "$(json_esc "$method")" "$(json_esc "$pass")"
+    printf '    {"type":"shadowsocks","tag":"v6","server":"%s","server_port":%s,"method":"%s","password":"%s","domain_resolver":"res-v6"}\n' \
+        "$(json_esc "$h6")" "$port" "$(json_esc "$method")" "$(json_esc "$pass")"
+    printf '  ],\n  "route": { "rules": [{"ip_version":4,"outbound":"v4"},{"ip_version":6,"outbound":"v6"}] }\n}\n'
+}
 logic_members() {  # $1=节点名
     [ -f "$LOGIC_CONF" ] || return 0
     grep -v '^#' "$LOGIC_CONF" 2>/dev/null | awk -F'|' -v n="$1" '$1==n'
@@ -951,10 +985,10 @@ tproxy_port_conflicts() {  # 列出代理端口段里被"非 sing-box"占用的�
 }
 
 ss_enabled_count() {
-    local n=0 l name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable
+    local n=0 l name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 a11
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 <<< "$l"
+        IFS="|" read -r name proto a1 a2 a3 a4 a5 a6 a7 a8 a9 enable a10 a11 <<< "$l"
         case "$proto" in
             ss|ss2022|logic) [ "${enable:-1}" != "0" ] && n=$((n + 1)) ;;
         esac
@@ -1007,10 +1041,10 @@ remove_tproxy_sysctl() {
 
 apply_ss_units() {
     local force="${1:-0}"
-    local name proto host port method pass enable l cmd
+    local name proto host port method pass enable l cmd host6
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp <<< "$l"
+        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp host6 <<< "$l"
         case "$proto" in ss|ss2022|logic) ;; *) continue ;; esac
         local u="mr-ss-$mark.service"
         if [ "$enable" = "0" ]; then
@@ -1033,6 +1067,9 @@ apply_ss_units() {
         local newcfg newunit
         if [ "$proto" = "logic" ]; then
             newcfg="$(logic_cfg_json "$name" "$lport")"
+        elif [ -n "${host6:-}" ] && { [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ]; }; then
+            # 双隧道分流：v4 目标走 v4 隧道、v6 目标走 v6 隧道
+            newcfg="$(split_cfg_json "$lport" "$host" "$host6" "$port" "$method" "$pass")"
         else
         local inb v6in
         inb="$(printf '{"type":"tproxy","tag":"tproxy-in","listen":"%s","listen_port":%s,"network":["tcp","udp"]}' \
@@ -1899,7 +1936,7 @@ uninstall_all() {
     # 单元是按 mark 命名的（中文名不能做 systemd 单元名），这里必须用 mark
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp mhost6 <<< "$l"
         case "$proto" in
             ss|ss2022|logic) systemctl disable --now "mr-ss-$mark.service" >/dev/null 2>&1 || true ;;
         esac
@@ -1910,7 +1947,7 @@ uninstall_all() {
     info "清理 wg 接口与策略路由 ..."
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp mhost6 <<< "$l"
         [ "$proto" = "wg" ] || continue
         table="$(wg_table "$name")"
         ip rule del fwmark "$mark" table "$table" 2>/dev/null || true
@@ -2439,6 +2476,25 @@ doctor() {
             check_item "出口密码格式" 0 "全部符合所选算法"
         fi
     fi
+    # 双隧道分流：两腿是否都还能解析/连得上（域名可能变）
+    if [ -f "$EXITS_CONF" ]; then
+        local _sn _sp _sh4 _sh6 _sfam6 _sbad=""
+        while IFS='|' read -r _sn _sp _sh4 _ __ _ __ _ __ _ __ _ __ _sh6; do
+            case "$_sn" in ''|'#'*) continue ;; esac
+            case "$_sp" in ss|ss2022) ;; *) continue ;; esac
+            [ -n "$_sh6" ] || continue
+            case "$(addr_family "$_sh4")" in
+                v4|both) ;; *) _sbad="$_sbad $_sn(v4侧异常)" ;;
+            esac
+            case "$(addr_family "$_sh6")" in
+                v6|both) ;; *) _sbad="$_sbad $_sn(v6侧异常)" ;;
+            esac
+        done < "$EXITS_CONF"
+        if [ -n "$_sbad" ]; then
+            printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "双隧道地址" "$_sbad"
+            info "某一侧的地址族解析不出来时，该族目标会连不上；可用 [3] → [8] 修正"
+        fi
+    fi
     # 绑定 IP 是否落在网桥网段（容器多网卡时容易绑错，导致代理不生效 + API 认不出身份）
     if [ -f "$BIND_CONF" ]; then
         local _bn _bip _bex _bmk _cidr _badip=""
@@ -2546,7 +2602,7 @@ api_listen_addr() {
 # ---------------------------------------------------------------- 出口菜单
 
 exit_edit() {
-    local f num name proto host port method pass mark wgkey wgif local expect enable lp
+    local f num name proto host port method pass mark wgkey wgif local expect enable lp host6
     local field val reason methods m msel i
     title "修改出口节点"
     exits_print_numbered
@@ -2558,7 +2614,7 @@ exit_edit() {
     [ -n "$name" ] || { err "编号不存在"; pause_back; return 1; }
     while :; do
         f="$(exit_get "$name")"
-        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp <<< "$f"
+        IFS='|' read -r name proto host port method pass mark wgkey wgif local expect enable lp host6 <<< "$f"
         title "修改：$name"
         printf '  %-14s %s\n' "协议" "$(proto_label "$proto")"
         printf '  %-14s %s\n' "地址" "${host:-(本机)}"
@@ -2566,6 +2622,7 @@ exit_edit() {
         printf '  %-14s %s\n' "加密方式" "${method:-（不适用）}"
         printf '  %-14s %s\n' "密码" "$([ -n "$pass" ] && echo '已设置（不显示）' || echo '未设置')"
         printf '  %-14s %s\n' "期望出口 IP" "${expect:-—}"
+        printf '  %-14s %s\n' "第二地址" "${host6:-（单隧道）}"
         printf '  %-14s %s\n' "指定本地端口" "${lp:-自动}"
         printf '  %-14s %s\n' "状态" "$([ "$enable" = "0" ] && echo 停用 || echo 启用)"
         subline
@@ -2580,6 +2637,9 @@ exit_edit() {
         fi
         printf '    %s[6]%s 期望出口 IP\n' "$GREEN" "$NC"
         printf '    %s[7]%s 启用 / 停用\n' "$GREEN" "$NC"
+        if [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ]; then
+            printf '    %s[8]%s 第二隧道地址（双隧道分流）：%s\n' "$GREEN" "$NC" "${host6:-未设置（单隧道）}"
+        fi
         printf '    %s[0]%s 返回上一层\n' "$YELLOW" "$NC"
         line
         printf '请输入选项: '; read -r msel || return 0
@@ -2671,6 +2731,25 @@ exit_edit() {
                 ok "状态已切换并重新下发"
                 pause_back
                 ;;
+            8)
+                [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ] || { echo "无效选择"; sleep 1; continue; }
+                printf ' 第二隧道地址（v6 侧；留空=关闭双隧道，0 返回）: '; read -r val || return 0
+                case "$val" in 0) continue ;; esac
+                if [ -n "$val" ]; then
+                    case "$(addr_family "$val")" in
+                        v6|both) ;;
+                        *) err "这不是 IPv6 地址，也没有 AAAA 记录：$val"; continue ;;
+                    esac
+                    case "$(addr_family "$host")" in
+                        v4|both) ;;
+                        *) err "主地址不是 v4 侧（$host）：请先把 [2] 服务器地址改成 IPv4 或带 A 记录的域名"; continue ;;
+                    esac
+                fi
+                edit_exit_field "$name" 14 "$val" || continue
+                host6="$val"
+                edit_apply_changes
+                ;;
+            *) echo "无效选择"; sleep 1 ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
     done
@@ -2684,12 +2763,12 @@ edit_apply_changes() {
 }
 
 edit_exit_field() {  # $1=出口名 $2=字段号 $3=新值
-    local name="$1" fn="$2" val="$3" line a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13
+    local name="$1" fn="$2" val="$3" line a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14
     [ -f "$EXITS_CONF" ] || return 1
     : > "$EXITS_CONF.tmp"
     while IFS= read -r line; do
         case "$line" in ''|'#'*) printf '%s\n' "$line" >> "$EXITS_CONF.tmp"; continue ;; esac
-        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 <<< "$line"
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 <<< "$line"
         if [ "$a1" = "$name" ]; then
             case "$fn" in
                 1) a1="$val" ;;
@@ -2700,8 +2779,9 @@ edit_exit_field() {  # $1=出口名 $2=字段号 $3=新值
                 11) a11="$val" ;;
                 12) a12="$val" ;;
                 13) a13="$val" ;;
+                14) a14="$val" ;;
             esac
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$a12" "$a13" >> "$EXITS_CONF.tmp"
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$a12" "$a13" "$a14" >> "$EXITS_CONF.tmp"
         else
             printf '%s\n' "$line" >> "$EXITS_CONF.tmp"
         fi
@@ -2936,7 +3016,7 @@ exit_add_extend() {
 }
 
 exit_add() {
-    local name proto host port method pass wgkey wgif local expect mark lp reason
+    local name proto host port method pass wgkey wgif local expect mark lp reason host6 tunnel
     local methods m msel i proto_sel step="proto" owner np cand ssn
     clear_if_tty
     title "新增出口节点"
@@ -3029,6 +3109,45 @@ exit_add() {
             else
                 reason="$(ss_classic_pass_check "$pass")" || { err "$reason"; continue; }
             fi
+            # 双栈宿主：可选双隧道分流（v4/v6 各走自己的隧道）
+            if { [ "$proto" = "ss" ] || [ "$proto" = "ss2022" ]; } && \
+               ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
+                step="tunnel"
+            else
+                step="expect"
+            fi
+            ;;
+        tunnel)
+            printf '\n隧道模式（宿主机双栈）：\n'
+            printf '  %s[1]%s 单隧道（默认）：所有目标共用一条隧道\n' "$GREEN" "$NC"
+            printf '  %s[2]%s 双隧道分流：IPv4 目标走 v4 隧道、IPv6 目标走 v6 隧道\n' "$GREEN" "$NC"
+            printf '  %s[0]%s 返回上一步\n' "$YELLOW" "$NC"
+            printf '请输入 [0-2]（回车=1）: '; read -r tsel || return 0
+            case "$tsel" in
+                0) info "已返回密码输入"; step="password"; continue ;;
+                2) ;;
+                *) host6=""; step="expect"; continue ;;
+            esac
+            # 判断已填地址属于哪一族，补齐另一族
+            local fam; fam="$(addr_family "$host")"
+            if [ "$fam" = "v6" ]; then
+                printf 'IPv4 隧道地址（IPv4 或 有 A 记录的域名，0 返回上一步）: '; read -r v4addr || return 0
+                case "$v4addr" in 0|"") info "已返回模式选择"; step="tunnel"; continue ;; esac
+                case "$(addr_family "$v4addr")" in
+                    v4|both) ;;
+                    *) err "这不是 IPv4 地址，也没有 A 记录：$v4addr"; continue ;;
+                esac
+                host6="$host"; host="$v4addr"
+            else
+                printf 'IPv6 隧道地址（IPv6 或 有 AAAA 记录的域名，0 返回上一步）: '; read -r v6addr || return 0
+                case "$v6addr" in 0|"") info "已返回模式选择"; step="tunnel"; continue ;; esac
+                case "$(addr_family "$v6addr")" in
+                    v6|both) ;;
+                    *) err "这不是 IPv6 地址，也没有 AAAA 记录：$v6addr"; continue ;;
+                esac
+                host6="$v6addr"
+            fi
+            ok "已启用双隧道：v4 → $host ；v6 → $host6"
             step="expect"
             ;;
         wgport)
@@ -3057,7 +3176,13 @@ exit_add() {
             ;;
         expect)
             printf '期望出口 IP（留空=服务器地址，输入 0 返回上一步）: '; read -r expect || return 0
-            case "$expect" in 0) info "已返回上一步"; step=$([ "$proto" = "wg" ] && echo wglocal || echo password); continue ;; esac
+            case "$expect" in 0)
+                info "已返回上一步"
+                if [ "$proto" = "wg" ]; then step="wglocal"
+                elif ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then step="tunnel"
+                else step="password"; fi
+                continue ;;
+            esac
             [ -n "$expect" ] || expect="$host"
             mark="$(mark_next)"
             lp=""
@@ -3084,7 +3209,7 @@ exit_add() {
                     esac
                     ;;
             esac
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" "$lp" >> "$EXITS_CONF"
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|1|%s|%s\n' "$name" "$proto" "$host" "$port" "$method" "$pass" "$mark" "$wgkey" "$wgif" "$local" "$expect" "$lp" "$host6" >> "$EXITS_CONF"
             ok "已新增出口 $name（$(proto_label "$proto")，mark $mark）"
             info "正在自动下发规则 ..."
             apply_all
@@ -3097,17 +3222,14 @@ exit_add() {
 
 exit_set_enable() {
     # $1=出口名 $2=1/0
-    local want="$1" val="$2" l a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13
+    local want="$1" val="$2" l a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14
     : > "$EXITS_CONF.tmp"
     while IFS= read -r l; do
         case "$l" in ''|'#'*) printf '%s\n' "$l" >> "$EXITS_CONF.tmp"; continue ;; esac
-        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 <<< "$l"
+        IFS='|' read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 <<< "$l"
         if [ "$a1" = "$want" ]; then
-            if [ -n "$a13" ]; then
-                printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" "$a13" >> "$EXITS_CONF.tmp"
-            else
-                printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" >> "$EXITS_CONF.tmp"
-            fi
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+                "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$val" "$a13" "$a14" >> "$EXITS_CONF.tmp"
         else
             printf '%s\n' "$l" >> "$EXITS_CONF.tmp"
         fi
@@ -3121,7 +3243,7 @@ exits_print_numbered() {
     : > "$1"
     while IFS= read -r l; do
         case "$l" in ''|'#'*) continue ;; esac
-        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp <<< "$l"
+        IFS='|' read -r name proto host port meth pass mark wgkey wgif local expect enable lp mhost6 <<< "$l"
         [ "$enable" = "0" ] && st="${YELLOW}停用${NC}" || st="${GREEN}启用${NC}"
         printf '  %s%2s%s  %-16s %-18s %-20s %-6s %-8s %b\n' "$GREEN" "$idx" "$NC" "$name" "$(proto_label "$proto")" "$host" "$port" "$mark" "$st"
         printf '%s\n' "$name" >> "$1"
@@ -3172,7 +3294,7 @@ exit_del() {
             printf ' 确认删除全部 %s 个出口? 输入 yes: ' "$(exits_count)"
             read -r a || return 0
             [ "$a" = "yes" ] || { info "已取消"; rm -f "$f"; return 0; }
-            printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口' > "$EXITS_CONF"
+            printf '%s\n' '# 名称|协议|地址|端口|加密|密码|mark|wg公钥|wg接口|隧道本端|期望出口IP|启用|指定本地端口|第二地址(双隧道)' > "$EXITS_CONF"
             printf '%s\n' '# 容器|IPv4|出口|mark' > "$BIND_CONF"
             apply_all >/dev/null 2>&1
             ok "已删除全部出口，相关绑定已清空"
