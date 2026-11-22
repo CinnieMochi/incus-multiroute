@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Incus MultiRoute 宿主机出口管理脚本 v3.4.14
+# Incus MultiRoute 宿主机出口管理脚本 v3.4.15
 # 作用：在 incus 宿主机上管理 LXC 用户的出站出口（ss / ss2022 / wg）
 # 风格：与本机其它运维脚本（lxc.sh 等）保持一致
 #
@@ -41,12 +41,16 @@ BRIDGE_IPV6_AUTO="${BRIDGE_IPV6_AUTO:-0}"
 BRIDGE_IPV4_AUTO="${BRIDGE_IPV4_AUTO:-0}"
 AUTO_HARDEN="${AUTO_HARDEN:-0}"
 V6_MATCH_ANY="${V6_MATCH_ANY:-auto}"
+# 外联端口限制：禁止容器访问这些目的端口（TCP+UDP；空=不限制）
+BLOCK_EGRESS_PORTS="${BLOCK_EGRESS_PORTS:-22}"
+# 1=允许容器之间互访这些端口（内网直连），0=连容器之间也禁
+BLOCK_EGRESS_ALLOW_LAN="${BLOCK_EGRESS_ALLOW_LAN:-1}"
 NFT_FILE="$DATA_DIR/mr.nft"
 UNIT_DIR="/etc/systemd/system"
 API_PY="/usr/local/bin/mr-api.py"
 SELF_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-SCRIPT_VERSION="3.4.14"
+SCRIPT_VERSION="3.4.15"
 REPO_OWNER="CinnieMochi"
 REPO_NAME="incus-multiroute"
 REPO_BRANCH="main"
@@ -280,6 +284,17 @@ bridge_ipv6() {
     ip -6 -o addr show dev "$b" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
 }
 
+bridge_v4_net() {
+    # 网桥的 IPv4 网段（用于"这些地址属于容器"的源匹配）
+    local b="${BRIDGE:-incusbr0}"
+    ip -4 route show dev "$b" scope link 2>/dev/null | awk '{print $1}' | grep -E '^[0-9.]+/[0-9]+$' | head -1
+}
+
+bridge_v6_net() {
+    local b="${BRIDGE:-incusbr0}"
+    ip -6 route show dev "$b" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9a-fA-F:]+/[0-9]+$' | grep -v '^fe80' | head -1
+}
+
 bridge_ipv4() {
     # 网桥的 IPv4 地址（透明代理入站绑它）
     local b="${BRIDGE:-incusbr0}"
@@ -458,7 +473,7 @@ gen_nft() {
     elems="$(grep -v '^#' "$BIND_CONF" 2>/dev/null | awk -F'|' 'NF>=4 && $2!="" && $4!="" {printf "%s%s : %s", (n++ ? ",\n        " : "\n        "), $2, $4}')"
     # IPv6：只有网桥配了 IPv6 才启用整套 v6 规则
     BRIDGE6="$(bridge_ipv6 2>/dev/null)"
-    local has6=0 elems6="" bypass6="::1/128, fe80::/10, fc00::/7, ff00::/8" v6plan=""
+    local has6=0 elems6="" bypass6="::1/128, fe80::/10, fc00::/7, ff00::/8" v6plan="" cgw6=""
     V6_SCOPE="strict"; V6_BROAD=0; V6_MAPN=0
     if [ -n "$BRIDGE6" ]; then
         has6=1
@@ -468,6 +483,7 @@ gen_nft() {
             [ "$(printf '%s' "$v6plan" | jq -r '.broad // false')" = "true" ] && V6_BROAD=1
             local _bp
             _bp="$(printf '%s' "$v6plan" | jq -r '.bypass // [] | join(", ")')"
+            cgw6="$(printf '%s' "$v6plan" | jq -r '.src6 // [] | join(", ")')"
             [ -n "$_bp" ] && bypass6="$_bp"
             elems6="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | .[]' | awk '{printf "%s        %s", (n++ ? ",\n" : "\n"), $0}')"
             V6_MAPN="$(printf '%s' "$v6plan" | jq -r '.ip6map // [] | length')"
@@ -509,9 +525,41 @@ gen_nft() {
                 printf '    map c_ip6 {\n        type ipv6_addr : mark\n        flags interval\n    }\n'
             fi
         fi
+        if [ "$has6" = "1" ] && [ -n "$cgw6" ] && [ -n "${BLOCK_EGRESS_PORTS:-}" ]; then
+            printf '    set cgw6 {\n        type ipv6_addr\n        flags interval\n        elements = { %s }\n    }\n' "$cgw6"
+        fi
         # 透明代理：TCP + UDP 都走 tproxy（需要 br_netfilter=0）
         echo '    chain prerouting {'
         echo '        type filter hook prerouting priority mangle; policy accept;'
+        # ---- 外联端口限制（覆盖桥内容器与 routed 网卡的独立公网 v6）----
+        local _blk="" _p4="" _b4n="" _b6n="" _ex4="" _ex6="" _setp=""
+        if [ -n "${BLOCK_EGRESS_PORTS:-}" ]; then
+            for _p4 in $(printf '%s' "$BLOCK_EGRESS_PORTS" | tr ',' ' '); do
+                case "$_p4" in *[!0-9]*|"") continue ;; esac
+                [ "$_p4" -ge 1 ] && [ "$_p4" -le 65535 ] && _blk="$_blk $_p4"
+            done
+            _blk="$(printf '%s' "$_blk" | sed 's/^ *//')"
+        fi
+        if [ -n "$_blk" ]; then
+            _setp="{ $(printf '%s' "$_blk" | sed 's/ /, /g') }"
+            _b4n="$(bridge_v4_net 2>/dev/null)"
+            _b6n="$(bridge_v6_net 2>/dev/null)"
+            if [ "${BLOCK_EGRESS_ALLOW_LAN:-1}" = "1" ]; then
+                [ -n "$_b4n" ] && _ex4="ip daddr != $_b4n "
+                [ -n "$_b6n" ] && _ex6="ip6 daddr != $_b6n "
+            fi
+            if [ -n "$_b4n" ]; then
+                echo "        ip saddr $_b4n ${_ex4}tcp dport $_setp counter drop"
+                echo "        ip saddr $_b4n ${_ex4}udp dport $_setp counter drop"
+            fi
+            if [ "$has6" = "1" ]; then
+                [ -n "$cgw6" ] || cgw6="$_b6n"
+                if [ -n "$cgw6" ]; then
+                    echo "        ip6 saddr @cgw6 ${_ex6}tcp dport $_setp counter drop"
+                    echo "        ip6 saddr @cgw6 ${_ex6}udp dport $_setp counter drop"
+                fi
+            fi
+        fi
         echo "        iifname \"$BRIDGE\" ip daddr @bypass4 return"
         if [ "$has6" = "1" ]; then
             if [ "$V6_SCOPE" = "wide" ]; then
@@ -715,9 +763,25 @@ except Exception:
     pass
 bypass_out = [str(n) for n in sorted(_bnets, key=lambda x: (x.prefixlen, int(x.network_address)))]
 
+src6 = set()
+for _nm in instances:
+    src6 |= prefixes_of(_nm)
+if bridge_net is not None:
+    src6.add(bridge_net)
+for tok in run(['ip', '-6', '-o', 'addr', 'show', 'scope', 'global']).split():
+    if '/' in tok and ':' in tok:
+        try:
+            src6.add(ipaddress.ip_interface(tok).network)
+        except Exception:
+            pass
+try:
+    src6_out = [str(n) for n in ipaddress.collapse_addresses(src6)]
+except Exception:
+    src6_out = [str(n) for n in src6]
 print(json.dumps({'mode': 'wide' if wide else 'strict',
                   'ip6map': ip6map,
                   'bypass': bypass_out,
+                  'src6': src6_out,
                   'broad': hostprefix_broad, 'missing': missing}))
 PYCODE
 }
@@ -2449,6 +2513,85 @@ bridge_family_menu() {
     done
 }
 
+egress_block_menu() {
+    local a p cur lan
+    while :; do
+        clear_if_tty
+        title "外联端口限制"
+        cur="${BLOCK_EGRESS_PORTS:-}"
+        lan="$([ "${BLOCK_EGRESS_ALLOW_LAN:-1}" = "1" ] && echo 允许 || echo 禁止)"
+        printf '  %s当前限制%s  端口: %s\n' "$BLUE" "$NC" "$(printf '%s' "$cur" | sed 's/,/、/g')"
+        printf '  %s容器互访%s  %s\n' "$BLUE" "$NC" "$lan"
+        info "作用：禁止容器访问外部主机的这些目的端口（TCP + UDP，IPv4 + IPv6）"
+        info "同时覆盖普通桥内容器与持有独立公网 IPv6 的容器"
+        subline
+        printf '    %s[1]%s 查看当前规则（含命中计数）\n' "$GREEN" "$NC"
+        printf '    %s[2]%s 添加端口\n' "$GREEN" "$NC"
+        printf '    %s[3]%s 删除端口\n' "$GREEN" "$NC"
+        printf '    %s[4]%s 切换「容器互访」：%s\n' "$GREEN" "$NC" "$lan"
+        printf '    %s[5]%s 清空限制（全部放行）\n' "$GREEN" "$NC"
+        printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
+        line
+        printf '请输入选项 [0-5]: '; read -r a || return 0
+        case "$a" in
+            0|"") return 0 ;;
+            1)
+                title "当前外联限制规则"
+                nft list chain inet multiroute prerouting 2>/dev/null | grep -E 'dport' | grep 'counter drop' | sed 's/^ */  /'
+                [ -n "$cur" ] || info "当前未设置任何端口限制"
+                pause_back
+                ;;
+            2)
+                printf ' 添加端口（多个用逗号，0 返回）: '; read -r p || return 0
+                case "$p" in 0|"") continue ;; esac
+                local bad="" okp=""
+                for x in $(printf '%s' "$p" | tr ',' ' '); do
+                    case "$x" in *[!0-9]*) bad="$bad $x"; continue ;; esac
+                    [ "$x" -ge 1 ] && [ "$x" -le 65535 ] || { bad="$bad $x"; continue; }
+                    okp="$okp,$x"
+                done
+                [ -n "$bad" ] && { err "非法端口:$bad"; pause_back; continue; }
+                local nv="$cur$okp"
+                nv="$(printf '%s' "$nv" | tr ',' '\n' | sed '/^$/d' | sort -n -u | paste -sd, -)"
+                save_main_var BLOCK_EGRESS_PORTS "$nv"; BLOCK_EGRESS_PORTS="$nv"
+                apply_nft_only >/dev/null 2>&1
+                ok "已添加；当前限制: $(printf '%s' "$nv" | sed 's/,/、/g')"
+                pause_back
+                ;;
+            3)
+                printf ' 要删除的端口（多个用逗号，0 返回）: '; read -r p || return 0
+                case "$p" in 0|"") continue ;; esac
+                local nv="$cur" d
+                for d in $(printf '%s' "$p" | tr ',' ' '); do
+                    nv="$(printf '%s' "$nv" | tr ',' '\n' | grep -vx "$d" | paste -sd, -)"
+                done
+                save_main_var BLOCK_EGRESS_PORTS "$nv"; BLOCK_EGRESS_PORTS="$nv"
+                apply_nft_only >/dev/null 2>&1
+                ok "已更新；当前限制: $([ -n "$nv" ] && printf '%s' "$nv" | sed 's/,/、/g' || echo 无)"
+                pause_back
+                ;;
+            4)
+                if [ "${BLOCK_EGRESS_ALLOW_LAN:-1}" = "1" ]; then
+                    save_main_var BLOCK_EGRESS_ALLOW_LAN 0; BLOCK_EGRESS_ALLOW_LAN=0
+                    info "已改为：容器之间也不允许访问这些端口"
+                else
+                    save_main_var BLOCK_EGRESS_ALLOW_LAN 1; BLOCK_EGRESS_ALLOW_LAN=1
+                    info "已改为：容器之间允许互访这些端口"
+                fi
+                apply_nft_only >/dev/null 2>&1
+                pause_back
+                ;;
+            5)
+                printf ' 确认清空全部端口限制? [y/N]: '; read -r p || return 0
+                case "$p" in [yY]) ;; *) info "已取消"; continue ;; esac
+                save_main_var BLOCK_EGRESS_PORTS ""; BLOCK_EGRESS_PORTS=""
+                apply_nft_only >/dev/null 2>&1
+                ok "已清空，容器可访问任意端口"; pause_back
+                ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
 aux_menu() {
     local a
     while :; do
@@ -2456,14 +2599,16 @@ aux_menu() {
         title "辅助功能（选择性开启）"
         printf '    %s[1]%s 网桥地址族（IPv4 / IPv6 开启或关闭）\n' "$GREEN" "$NC"
         printf '    %s[2]%s 安全加固（源 IP 防伪）\n' "$GREEN" "$NC"
+        printf '    %s[3]%s 外联端口限制（禁止容器访问指定端口）\n' "$GREEN" "$NC"
         printf '    %s[0]%s 返回\n' "$YELLOW" "$NC"
         line
-        printf '请输入选项 [0-2]: '
+        printf '请输入选项 [0-3]: '
         read -r a || return 0
         case "$a" in
             0|"") return 0 ;;
             1) bridge_family_menu ;;
             2) sec_menu ;;
+            3) egress_block_menu ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
     done
@@ -2723,6 +2868,14 @@ doctor() {
             printf '  %s[注意]%s %-26s %s\n' "$YELLOW" "$NC" "双隧道地址" "$_sbad"
             info "某一侧的地址族解析不出来时，该族目标会连不上；可用 [3] → [8] 修正"
         fi
+    fi
+    # 外联端口限制
+    if [ -n "${BLOCK_EGRESS_PORTS:-}" ]; then
+        local _bp_lan
+        _bp_lan="$([ "${BLOCK_EGRESS_ALLOW_LAN:-1}" = "1" ] && echo "容器互访豁免" || echo "容器互访也禁止")"
+        check_item "外联端口限制" 0 "已禁止容器访问 $(printf '%s' "$BLOCK_EGRESS_PORTS" | sed 's/,/、/g')（TCP+UDP，IPv4+IPv6；$_bp_lan）"
+    else
+        printf '  %s[说明]%s %-26s %s\n' "$BLUE" "$NC" "外联端口限制" "未设置（菜单 [17] → [3] 可开启）"
     fi
     # IPv6 代理模式与地址映射（与 nft 生成同一套规划器）
     if [ -n "$(bridge_ipv6 2>/dev/null)" ] && has_cmd python3 && has_cmd jq; then

@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.4.15
+- 新增「外联端口限制」（`[17]` → `[3]`）：禁止容器访问指定目的端口
+  - 默认限制 22，TCP + UDP、IPv4 + IPv6 全覆盖
+  - 规则写在 prerouting 最前面，**先于 TPROXY**，绑定出口的容器同样被拦
+  - IPv6 侧用自动构建的 `cgw6` 集合（网桥 ULA + 宿主前缀 + 容器前缀），覆盖 routed 网卡的独立公网 IPv6
+  - 默认允许容器之间互访（`BLOCK_EGRESS_ALLOW_LAN=1`），可切换
+  - 菜单支持查看（含计数）/ 添加 / 删除 / 清空 / 切换互访
+- 体检新增「外联端口限制」一行
+
 ## v3.4.14
 - 修复：安全加固 `[17]→[2]` 在启用 TPROXY 的机器上「IPv6 全部开启」报失败
   - 根因：Incus 的 `security.ipv6_filtering` 要求 `net.bridge.bridge-nf-call-ip6tables=1`，
